@@ -1,0 +1,22 @@
+# R History and Data files
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rproj.user/
+
+# Ignore all data files (we only want the code on GitHub)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Ignore Stan/brms compiled models and MCMC outputs
+*.rds
+*.Rdata
+*.so
+*.o
+
+# Ignore OS generated files
+.DS_Store
+Thumbs.db
