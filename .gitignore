@@ -5,7 +5,7 @@
 .Ruserdata
 *.Rproj.user/
 
-# Ignore all data files (we only want the code on GitHub)
+# Ignore all data files
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
@@ -20,3 +20,22 @@ data/processed/*
 # Ignore OS generated files
 .DS_Store
 Thumbs.db
+
+# Ignore misc Milestone files
+
+# Ignore Quarto and Rmd build artifacts
+.quarto/
+_freeze/
+*_files/
+*_cache/
+*.tex
+*.html
+*.jpeg
+*.png
+*.docx
+
+# Ignore .pdf in the notebooks to keep in the /reports directory
+notebooks/*.pdf
+
+# Keep saved fitDist results
+!dist_fits_bic.csv

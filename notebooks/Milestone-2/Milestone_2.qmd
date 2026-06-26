@@ -1,0 +1,909 @@
+---
+title: "Milestone 2: Interim Report"
+subtitle: "CIND820: Big Data Analytics Project"
+author:
+  - "Zachary Daulat (Student ID: 501210116)"
+  - "**Supervisor:** Dr. Ceni Babaoglu"
+date: last-modified
+---
+
+# Updated Project Proposal {#sec-proposal}
+
+This project conducts a causal inference evaluation of the City of Toronto's King Street Transit Pilot, launched on 12 November 2017 between Bathurst Street and Jarvis Street, and made permanent on 16 April 2019 [@toronto2019]. This analysis uses the disaggregated datasets collected as part of the pilot itself and published by the Toronto Transit Commission and the City of Toronto's Transportation Services on the city's Open Data Portal. These are the [Disaggregate headway and travel time](https://open.toronto.ca/dataset/king-street-pilot-disaggregate-headway-and-travel-time/), the [Detailed Bluetooth Travel Time](https://open.toronto.ca/dataset/king-st-transit-pilot-detailed-bluetooth-travel-time/), and the [Detailed Traffic and Pedestrian Volumes](https://open.toronto.ca/dataset/king-st-transit-pilot-detailed-traffic-pedestrian-volumes/) datasets. The analysis will be done in R, and I will use my own distributional synthetic control implementation written in R and Rust, addressing a gap in the existing R ecosystem.
+
+The three research questions established in Milestone 1 are unchanged:
+
+1.  Did the King Street Transit Pilot improve transit speed and reliability?
+2.  Did the Pilot genuinely improve transit performance, or did improvement along King Street come at the expense of worse performance on nearby streets due to redirected traffic?
+3.  Did the Pilot have a different effect during peak/rush hours compared with off-peak hours?
+
+I have further refined the methodological design since Milestone 1. There are three refinements I have settled that I will discuss here and motivate in more detail in @sec-rationale.
+
+First, the counterfactual will be constructed using a **distributional synthetic control** as opposed to the standard mean-matching synthetic control methods. "Reliability" in my research question 1 and the pilot's stated goals, connotes a distributional phenomenon that describes the *shape* of the distribution beyond the conditional means. The design extends the distributional synthetic control method of [@gunsilius2023] in two ways:
+
+(1) An added L2 ridge penalty to stabilize the donor weight computation. Sequential Bluetooth sensor-pair segments on the same corridor (so mostly sharing the same traffic) are expected to be highly collinear, particularly after travel times are distance-normalized to an inverse-speed metric.
+
+(2) A single set of weights is computed against the aggregated 2-Wasserstein distances of the pre-treatment periods/buckets, instead of averaging period-specific weights as in the existing implementation [@gunsilius2023; @gunsiliusdijcke2025].
+
+Second, the analysis will treat the intervention as **time-varying not static**. The treatment intensity changed materially during the pilot: transit signal priority was disabled at the start of the pilot and then reactivated in July 2018 [@munro2023; @toronto2019]. The design will combine a continuous time-since-treatment interaction with discrete treatment regime indicators rather than a simple before/after approach.
+
+Third, treatment effects will be estimated within a **Bayesian distributional regression** framework using the `bamlss` package to model the conditional distributional parameters in addition to the conditional means. The exact response distribution is left open at this stage, but based on the results obtained in @sec-dist-screening it will be a flexible four-parameter family.
+
+# Methodological Rationale {#sec-rationale}
+
+## Baseline Identification {#sec-baseline}
+
+### The Primary Baseline: the City of Toronto / TTC official evaluation
+
+The first and primary baseline is the approach used by the city as shown in the official published materials. The pilot was enabled by a technologically ambitious monitoring approach. Instead of manual low-sample traffic counts, the city installed a continuous passive sensing system: CAD/AVL GPS tracking of every streetcar, a downtown grid of Bluetooth sensors measuring general-traffic travel times between sensor pairs, and Miovision video-analytics units producing multimodal turning-movement counts at major intersections [@olejarz; @kuperman2018].
+
+The city measured its success against three metrics: reliability, ridership, and travel time. Reliability here was operationalized primarily as the percentage of streetcars arriving within four minutes during peak periods, supplemented by headway-distribution plots flagging bunching and gapping. The key idea about "reliability", however, is that it is understood as describing the variability of a customer's experience. This can be the variability in time waiting for a vehicle or the variability in the time travelling on a vehicle for example.
+
+The *analytical* treatment of this rich data was only descriptive, however. The monthly dashboards report raw period averages, an "average and 90% range" band for travel times, and year-over-year comparisons to absorb seasonality [@toronto2019b]. For the network spillover question, the city compared average Bluetooth car travel times and volumes on parallel streets before and after the pilot, concluding that average vehicle travel times on nearby streets varied by "$\pm$ less than one minute" relative to before, with modest volume increases on Queen, Richmond, Adelaide, and Wellington streets [@toronto2019].
+
+The key issue of the approach for the purposes of this review, is what the official evaluation does *not* contain: there is no constructed counterfactual, no statistical inference, no quantification of uncertainty, and the intervention is treated as a single static before/after change.
+
+### The Domain Baseline: before/after comparisons and causal studies.
+
+The City's uncontrolled and descriptive before/after comparison is not a unique issue to the City of Toronto. It appears to be the conventional approach in transit-priority evaluation more generally, and an explicitly documented weakness in the field. In a recent causal-inference evaluation of exclusive bus lanes, [@debrito-filho2025] observe that improvements reported by transportation agencies following interventions like this "often lack rigorous evaluation using causal inference methods", and that "most existing studies rely on a simplistic before-and-after assessment, lacking the rigorous statistical and causal inference frameworks necessary for unbiased evaluation" [@debrito-filho2025]. They further note that these simplistic before/after analyses can result in a wide range of and implausible effect sizes, often likely attributable to unobserved confounding [@debrito-filho2025].
+
+I was only able to find one peer-reviewed study applying a formal causal design to the King Street Pilot: [@higgins2024] estimate the pilot's effect on *condominium prices* using corridor-based difference-in-differences models and a pooled spatial autoregressive specification. Comparing condos near King Street against a control corridor along the Sheppard subway, they find \~2.7% additional price appreciation attributable to the pilot.
+
+Two issues with this study that limit its relevance for my analysis: its outcome is condominium *property values* not transit operations, and its counterfactual is only a single comparison corridor. [@higgins2024] themselves emphasize that changes to a transport network "reverberate" beyond the immediate corridor — the "network effect" — which complicates control selection. This is also the issue this project's Question 2 confronts.
+
+The closest publicly available analysis I was able to find so far, is a blog post published on 1 February 2019 to the University of Toronto's School of Cities' News blog by Nate Wessel, a PhD candidate at the time in Urban Planning. Wessel uses the untreated segment of King Street between Bathurst and Dufferin as a counterfactual to the treated portion of King Street between Bathurst and Jarvis [@wessel2019]. Wessel then compares the before/after mean travel time change between the two segments, finding that the counterfactual goes from 8.46 minutes to 8.27, and the treated segment from 16.97 to 14.02 minutes.
+
+Like the City's approach, Wessel considers the treatment as a simple before/after phenomenon despite the nature of the treatment changing due to the signal priority change. The counterfactual is also only a single segment on the same route connecting directly to the treated segment, so may not be independent from the treatment and therefore violating the non-interference requirement for a valid counterfactual. The counterfactual comparison is also only made between the mean travel times, not the distributions. Wessel does include before/after six-number statistical summaries of both directions of the treated segment during the evening rush hour, however, showing meaningful reductions in standard deviations and 90^th^ percentiles.
+
+So, from the city's official reporting, contemporary independent analyses, the only peer-reviewed causal study, and the only travel time causal analysis I was able to find so far, it appears that there may not be a principled counterfactual and causal analysis under interference applied to the Pilot's transit-performance outcomes, particularly for reliability. I would want to spend more time searching the literature, however, before confidently claiming this would truly be the first such analysis of the King Street Transit Pilot.
+
+## Gap Analysis & Justification {#sec-gap}
+
+The gap argument is organised as four limitations of the baseline, each paired with the component of the proposed research design that addresses it.
+
+| Baseline limitation | Project component | Key sources |
+|------------------------|------------------------|------------------------|
+| No constructed counterfactual; before/after differences vulnerable to confounders | Synthetic control method applied to transit performance outcomes | [@abadie2021; @higgins2024; @wessel2019] |
+| Static binary treatment despite change with and without transit signal priority | Time-varying treatment specification (continuous + regime breakpoints) | [@munro2023; @toronto2019; @allen2023] |
+| Simple spillover assessment despite an explicit interference structure | Network-aware interference design | [@grossi2023; @hudgens2008] |
+| Means and ranges reported despite "reliability" connoting variation and tail-concentrated effects | Distributional synthetic control with L2-regularised weights and aggregated 2-Wasserstein distances | [@gunsilius2023; @gunsiliusdijcke2025; @doudchenko2016; @abadie2021lhour; @ben-michael2021] |
+
+: Mapping of baseline limitations to project components
+
+### Limitation 1 — No counterfactual
+
+The City's before/after comparison attributes the entire observed change to the pilot, but the post-treatment period coincides with numerous other influences like seasonality and weather changes, other operational equipment changes, ongoing ridership and downtown growth and shifts, among others. A raw difference cannot parse the pilot's effect from these and other confounders. Even Wessel's use of the Bathurst-Dufferin segment relies on a single, hand-picked comparison directly connected to the treated segment, rather than a principled and independent counterfactual [@wessel2019]. The synthetic control method [@abadie2021] constructs a counterfactual as a weighted average of untreated donor units chosen to reproduce the treated unit's pre-treatment trajectory, constraining the weights to be non-negative and sum to one. Applying a synthetic control approach (with a distributional component I explain below in @sec-limit-4) to the pilot's *transit-performance* outcomes represents this project's most fundamental advance over the City and currently known literature baselines.
+
+### Limitation 2 — Static binary treatment despite intervention change
+
+The baselines treat the pilot as a single intervention beginning in November 2017, but transit signal priority was disabled when the pilot began and then reactivated in July 2018. The city credits this with improving the travel times even further, but it does change the nature of the treatment during the post-treatment period. Low-floor streetcars were also introduced on the 504 King streetcar route in early December 2017 with full deployment in late October 2018 [@toronto2019a]. This confounds the effect of the pilot, but the City explains that the low-floor vehicles were found to be \~10% slower for other routes while having higher capacity and better accessibility, so the pilot's measured effect may understate it's true benefit. A single before/after comparison blends these changes into one average effect. Enforcement of the policy appears to be inconsistent over time as well, with @allen2023 estimating from the City's traffic volume and ticket data that fewer than 0.3% of violations at several intersections along King Street were ticketed in 2019. If this is the case, it suggests the policy might have had an even stronger effect if the policy was better enforced.
+
+The proposed design instead structures the treatment as both gradual and regime-switching, by including a time-since-treatment interaction to capture acclimatization dynamics, and a discrete regime indicator encoding the signal priority activation change. The closest the City's design gets to capturing these changes are descriptive metrics in the periodic dashboard summaries [@toronto2019b].
+
+### Limitation 3 — Informal spillover despite explicit interference structure
+
+The pilot's mechanism is to divert traffic off King Street, so necessarily pushing vehicles onto parallel streets. The City assesses this with a simple before/after comparison of parallel-street travel times and volumes, but without a clear spillover estimand nor spatial diagnostics [@toronto2019]. An alternative in the methodological literature from @grossi2023 formally defines direct and spillover causal estimands for evaluating a new tramway line in Florence, Italy, under the partial interference assumption that interference occurs between nearby units but not units sufficiently far apart [@hudgens2008]. They estimate these effects with synthetic controls from control unit donors that lie outside the treated unit's interference neighbourhood [@grossi2023].
+
+The ideal design for this project would be something similar to Grossi et al., constructing synthetic counterfactuals for spillover-affected units as well as the treated units, and performing a true causal inference analysis for the spillover effect over time as well as the direct treatment effect. This may or may not be feasible with the available data because the donor pool now needs to estimate separate synthetic controls for each spillover segment, which the King Street Transit Pilot study geography may not be able to sustain. I will explore this in the modelling stage, and if the policy's spillover neighbourhood is not small enough then I will have to identify an alternative approach that makes more efficient use of the available data.
+
+### Limitation 4 — Means and ranges despite distributional tail phenomenon {#sec-limit-4}
+
+The pilot's most impressive results were distributional, particularly during the evening peak period. Nate Wessel's descriptive distributional analysis quantifies this improvement for the evening peak period (4-7pm), finding the travel time average standard deviation between both directions was 7.2 minutes before the treatment and 4.3 after [@wessel2019]. Before the treatment 19% of trips during the evening peak period were longer than 25 minutes compared to only 1.3% after, and the 90^th^ percentile travel time decreased from 28.7 to 19.9 minutes. The City just reported a mean and "90% range" band [@toronto2019b]. The City's performance summary also explained that the TTC's quarterly Customer Satisfaction Survey (CSS) found that trip duration perceptions showed meaningful improvement [@toronto2019a]. That result is consistent with existing literature showing that reliability is salient for rider satisfaction and perceived value [@carrion-madera2010; @chakrabarti2015].
+
+The distributional synthetic control method of Florian Gunsilius rather than matching the expected value of the treated unit's pre-treatment period, matches its entire *quantile function* as a weighted average of donor quantile functions. This produces a counterfactual distribution rather than a counterfactual point [@gunsilius2023], and the core optimization loop is to select the vector of donor weights that minimizes the 2-Wasserstein distance between that Wasserstein barycenter and the treated unit's distribution.
+
+My proposed design for this project extends this method in two ways, by (1) adding L2 regularization to better handle highly collinear donors and (2) minimizing the aggregated 2-Wasserstein distances across the entire time series together instead of finding per-period/-bucket optima and then averaging the weights.
+
+I am adding the L2 (ridge) regularization extension to help stabilize the weights for highly collinear Bluetooth sensor pair donor groups. I expect many donors to be highly correlated due to sharing the same traffic, and this is observed in @fig-corr-mat. The simplex constraint induces desirable L1-like sparsity behaviour by pushing donor weights to zero [@abadie2021], but it can also result in unstable weight splits that are highly sensitive to noise between highly collinear donors [@abadie2021lhour]. An L2 penalty will help distribute weights more smoothly between correlated donors rather than arbitrarily selecting one of them. I expect this simplex-plus-L2 combination will behave similarly to elastic-net regularization. Synthetic-control weight regularization is well-established for expected value outcomes via elastic-net [@doudchenko2016]. To my knowledge this has not been applied to *distributional* synthetic control weights yet.
+
+The second extension concerns how the weights are computed from the pre-treatment panel. The standard distributional synthetic control in `disco` solves a separate weighting problem for each pre-treatment period (bucket) and then takes the simple average of the per-bucket weight vectors [@gunsiliusdijcke2025]. My proposed design instead computes a single weight vector against the normalized sum of 2-Wasserstein distances across all pre-treatment period buckets. Instead of averaging the per-period optima I minimize the aggregated objective. The aggregated formulation also might provide temporal regularization benefits particularly when buckets are sparse, by requiring a single donor mix to reproduce the treated distribution across the whole pre-treatment period.
+
+A practical advantage of a parametric distributional regression approach is that it uses all of the data to estimate a few parameters instead of estimating quantiles independently while still permitting the fitted distribution to be translated back into any quantile of interest. So, I can still report interpretable "90^th^-percentile travel time" changes comparable to the baselines while retaining the full-distribution inference of the parametric approach. This will however require carefully selecting the appropriate distribution.
+
+For two univariate distributions $\mu, \nu$ with quantile functions $F_\mu^{-1}, F_\nu^{-1}$ , the squared 2-Wasserstein distance has the closed form
+
+$$W_2^2(\mu, \nu) \;=\; \int_0^1 \big( F_\mu^{-1}(q) - F_\nu^{-1}(q) \big)^2 \, dq .$$
+
+Taking $\mu$ as the treated unit's distribution and $\nu$ as the synthetic control's, the one-dimensional Wasserstein barycenter has quantile function $F_\nu^{-1}(q) = \sum_{j=1}^{J} w_j\, G_j^{-1}(q)$, a weighted average of the donor quantile functions $G_j^{-1}$; the synthetic control problem chooses the weights $w$ so this barycenter is as close as possible in $W_2$, to the treated unit's distribution.
+
+The approach used by `disco`/Gunsilius:
+
+$$
+\mathbf{w}^{*}_{t}
+= \operatorname*{arg\,min}_{\mathbf{w}\,\in\,\Delta_{J}}
+\Big\lVert\, \hat{F}^{-1}_{t}
+- \sum_{j=1}^{J} w_{j}\, \hat{G}^{-1}_{j,t} \,\Big\rVert_{2}^{2},
+\qquad
+\bar{\mathbf{w}} = \frac{1}{T_{0}} \sum_{t=1}^{T_{0}} \mathbf{w}^{*}_{t} .
+$$
+
+My proposed L2-regularized objective function:
+
+$$
+\mathbf{w}^{*}
+= \operatorname*{arg\,min}_{\mathbf{w}\,\in\,\Delta_{J}}
+\;\frac{1}{T_{0} Q} \sum_{t=1}^{T_{0}}
+\Big\lVert\, \hat{F}^{-1}_{t}
+- \sum_{j=1}^{J} w_{j}\, \hat{G}^{-1}_{j,t} \,\Big\rVert_{2}^{2}
+\;+\; \lambda \,\lVert \mathbf{w} \rVert_{2}^{2} .
+$$ {#eq-statz-dscm}
+
+where:
+
+-   $\hat{F}^{-1}_{t} \in \mathbb{R}^{Q}$ — the treated unit's empirical quantile function in pre-treatment bucket $t$ evaluated on a grid of $Q$ quantile levels
+-   $\hat{G}^{-1}_{j,t} \in \mathbb{R}^{Q}$ — the quantile vector for donor $j$ with $j = 1, \dots, J$ indexing the $J$ donors
+-   $\mathbf{w} = (w_1, \dots, w_J)$ — the donor weight vector, constrained to the probability simplex $\Delta_{J} = \{\mathbf{w} : w_{j} \geq 0,\ \sum_{j} w_{j} = 1\}$
+-   $T_{0}$ is the number of pre-treatment buckets in the time series
+-   $\lambda \geq 0$ is the L2 (ridge) penalty parameter.
+
+Weights are denoted here with $\mathbf{w}$ rather than $\lambda$ as in @gunsilius2023, to avoid collision with the regularization parameter $\lambda$. The normalization term scales the 2-Wasserstein distance sum by the number of time series buckets and quantile levels so that $\lambda$ is interpretable and transferable regardless of $T_{0}$ and $Q$.
+
+Writing $f_{t}(\mathbf{w}) = \big\lVert \hat{F}^{-1}_{t} - \sum_{j=1}^{J} w_{j} \hat{G}^{-1}_{j,t} \big\rVert_{2}^{2}$ for the bucket-$t$ loss, the two designs differ in the order of the averaging and the minimization:
+
+$$
+\underbrace{\frac{1}{T_{0}} \sum_{t=1}^{T_{0}}
+\operatorname*{arg\,min}_{\mathbf{w}\in\Delta_{J}} f_{t}(\mathbf{w})}
+_{\texttt{disco}\text{: average of the argmins}}
+\;\;\neq\;\;
+\underbrace{\operatorname*{arg\,min}_{\mathbf{w}\in\Delta_{J}}
+\frac{1}{T_{0}} \sum_{t=1}^{T_{0}} f_{t}(\mathbf{w})}
+_{\text{proposed: argmin of the average}} .
+$$
+
+### Estimation framework: Bayesian distributional regression
+
+The final design choice I'd like to describe here is that the treatment effects will be estimated within a Bayesian distributional regression framework to model every parameter of a potentially complex response distribution as a function of the covariates. This can also more conveniently model autoregressive spatial effects if I take that approach, and skewed, non-negative responses naturally with a single hierarchical specification fitted by Markov Chain Monte Carlo [@klein2015; @umlauf2018]. While frequentist GAMLSS and spatial autoregression methods exist, a Bayesian approach can more conveniently propagate uncertainty across a multi-stage pipeline to the treatment effect estimates, when internal estimated components like the synthetic controls and spatial autoregression contribute uncertainty. While this extends beyond my theoretical knowledge, from my understanding the posterior distributions generated by a Bayesian approach also produces more reliable interval estimates for the higher statistical moments than the assumptions used in frequentist methods. The specific tool will likely be `bamlss` for its modularity and support for four-parameter distributions.
+
+# Data Profiling and Audit
+
+```{r}
+#| label: load-libraries
+#| echo: false
+
+library(tidyverse)
+library(sf)
+library(readr)
+library(ggplot2)
+# library(magrittr)
+library(spdep)
+```
+
+```{r}
+#| label: load-data
+#| echo: false
+
+segments <- read_sf("data/raw/bluetooth-travel-time-segments-wgs84")
+bt_tts <- bind_rows(
+    read_csv("data/raw/detailed-bluetooth-travel-time-2017.gz"),
+    read_csv("data/raw/detailed-bluetooth-travel-time-2018.gz")
+)
+ttc_tts <- read_csv("data/raw/ttc-disaggregate-travel-times.csv")
+```
+
+## Univariate, Bivariate, & Spatial Analysis
+
+### Travel Time Distributions
+
+```{r}
+#| label: prep-segments
+#| echo: false
+
+# Calculating inverse speed/pace from segment lengths for each travel time bucket
+travel_data <- bt_tts |>
+    left_join(
+        select(st_drop_geometry(segments), segment_na, length),
+        join_by(result_id == segment_na)
+    ) |>
+    mutate(
+        # Calculating inverse speed (seconds per 100 meters)
+        pace = (tt / length) * 100,
+
+        # Defining Pre/Post treatment
+        period = if_else(datetime_bin >= ymd("2017-11-12"), "Post-Treatment", "Pre-Treatment"),
+        period = factor(period, levels = c("Pre-Treatment", "Post-Treatment")),
+
+        # Classify Time of Day to TTC definitions
+        hour_of_day = hour(datetime_bin),
+        time_of_day = case_when(
+            hour_of_day >= 7 & hour_of_day < 10 ~ "AM Peak",
+            hour_of_day >= 16 & hour_of_day < 19 ~ "PM Peak",
+            TRUE ~ "Off-Peak"
+        ),
+        time_of_day = factor(time_of_day, levels = c("AM Peak", "PM Peak", "Off-Peak"))
+    ) |>
+    # Filter out erroneous negative travel times or zero distances
+    filter(tt > 0, length > 0)
+
+target_segments <- c(
+    "AD_UN_AD_YO", # Adelaide: Univ to Yonge (EB)
+    "RM_YO_RM_UN", # Richmond: Yonge to Univ (WB)
+    "KN_UN_KN_YO", # King: Univ to Yonge (EB)
+    "KN_YO_KN_UN", # King: Yonge to Univ (WB)
+    "KN_SP_QU_SP", # Spadina: King to Queen (NB)
+    "QU_SP_KN_SP", # Spadina: Queen to King (SB)
+    "DU_YO_DU_UN", # Dundas: Yonge to Univ (WB)
+    "DU_UN_DU_YO", # Dundas: Univ to Yonge (EB)
+    "QU_UN_QU_YO", # Queen: Univ to Yonge (EB)
+    "QU_YO_QU_UN"  # Queen: Yonge to Univ (WB)
+)
+
+bt_sample <- travel_data |>
+    filter(result_id %in% target_segments) |>
+    mutate(
+        segment_label = case_when(
+            result_id == "KN_UN_KN_YO" ~ "King (EB)",
+            result_id == "KN_YO_KN_UN" ~ "King (WB)",
+            result_id == "AD_UN_AD_YO" ~ "Adelaide (EB)",
+            result_id == "RM_YO_RM_UN" ~ "Richmond (WB)",
+            result_id == "QU_UN_QU_YO" ~ "Queen (EB)",
+            result_id == "QU_YO_QU_UN" ~ "Queen (WB)",
+            result_id == "DU_UN_DU_YO" ~ "Dundas (EB)",
+            result_id == "DU_YO_DU_UN" ~ "Dundas (WB)",
+            result_id == "KN_SP_QU_SP" ~ "Spadina (NB)",
+            result_id == "QU_SP_KN_SP" ~ "Spadina (SB)",
+        ),
+        segment_label = factor(segment_label, levels = c(
+            "King (EB)", "King (WB)",
+            "Adelaide (EB)", "Richmond (WB)",
+            "Queen (EB)", "Queen (WB)",
+            "Dundas (EB)", "Dundas (WB)",
+            "Spadina (NB)", "Spadina (SB)"
+        ))
+    )
+```
+
+```{r}
+#| label: prep-streetcars
+#| echo: false
+
+ttc_processed <- ttc_tts |>
+    mutate(
+        # Parsing TTC TimePeriod into standardized buckets
+        time_of_day = case_when(
+            str_starts(TimePeriod, "1-AM") ~ "AM Peak",
+            str_starts(TimePeriod, "3-PM") ~ "PM Peak",
+            TRUE ~ "Off-Peak"
+        ),
+        time_of_day = factor(time_of_day, levels = c("AM Peak", "PM Peak", "Off-Peak")),
+        
+        # Defining Pre/Post treatment period
+        period = if_else(ObservedDate >= ymd("2017-11-12"), "Post-Treatment", "Pre-Treatment"),
+        period = factor(period, levels = c("Pre-Treatment", "Post-Treatment")),
+    ) |>
+    filter(RunningTime > 0)
+```
+
+The travel time distributions are noticeably right-skewed and heavy-tailed across the vast majority of segments, in both directions, and time of day. The streetcar distributions in @fig-streetcar-tts below show clear post-treatment improvement particularly in the upper tail showing a fraction of the probability density as the pre-treatment distribution. The westbound PM Peak period appears to show the largest change.
+
+The general traffic travel times shown in @fig-traffic-tts show a variety of distributional shapes and changes between the treatment periods. Most segments show little change at all while King Street got worse, supporting the treatment effect *mechanism*. Some distributions like Richmond and the post-treatment PM Peak periods for northbound Spadina, have very heavy upper tails almost to the point of being linear. This diversity gives strong support to the need for a highly flexible response distribution beyond a simple Gaussian, which I explore in @sec-dist-screening. The distributional synthetic control method accommodates this diversity by matching distributions via their empirical quantile functions. These distributions also point to how much the baseline analyses might have been missing by a simple before-after comparison of the means and standard deviations.
+
+```{r}
+#| label: fig-streetcar-tts
+#| echo: false
+#| fig-cap: "TTC streetcar travel time distributions on the King St corridor before and after the policy was activated, in both directions, at different times of day."
+#| fig-width: 6.5
+#| fig-height: 5.5
+
+# "#DA251D"
+ttc_red <- rgb(218, 37, 29, maxColorValue = 255)
+ttc_blue <- "#00B0F0"
+
+plot_ttc <- ggplot(ttc_processed, aes(x = RunningTime, fill = period)) +
+    geom_density(alpha = 0.5, colour = NA) +
+    facet_grid(time_of_day ~ Direction) +
+    scale_fill_manual(values = c("Pre-Treatment" = ttc_blue,"Post-Treatment" = ttc_red)) +
+    # Truncate extreme outliers for a cleaner visual of the main distribution body
+    coord_cartesian(xlim = c(0, 40)) + 
+    labs(
+        x = "Travel Time (minutes)",
+        y = "Density",
+        fill = "Period"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom", 
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank()
+    )
+
+plot_ttc
+```
+
+```{=latex}
+\begin{landscape}
+```
+
+```{r}
+#| label: fig-traffic-tts
+#| echo: false
+#| fig-cap: "General traffic time reliability across both directions of a perpendicular street to King Street and a select sample of parallel streets to King Street that may be traffic substitution candidates. Travel times are normalized to inverse speed/pace (seconds per 100m) because of varying segment lengths."
+#| fig-width: 11
+#| fig-height: 6.5
+
+# fig-env: sidewaysfigure
+
+plot_bt <- ggplot(bt_sample, aes(x = pace, fill = period)) +
+    geom_density(alpha = 0.5, colour = NA) +
+    # Facet grid allows us to compare segments (columns) across times of day (rows)
+    facet_grid(time_of_day ~ segment_label) + 
+    scale_fill_manual(values = c("Pre-Treatment" = ttc_blue, "Post-Treatment" = ttc_red)) +
+    coord_cartesian(xlim = c(0, 100)) + 
+    labs(
+        x = "Pace (Seconds / 100m)",
+        y = "Density",
+        fill = "Period"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom", 
+        strip.text = element_text(face = "bold")
+    )
+
+plot_bt
+```
+
+```{=latex}
+\end{landscape}
+```
+
+### Skewness & Kurtosis {#sec-skew-kurtosis}
+
+```{r}
+#| label: prep-calc-moments
+#| echo: false
+
+ttc_moments <- ttc_processed |>
+    group_by(Direction, period, time_of_day) |>
+    summarise(
+        skew = e1071::skewness(RunningTime, na.rm = TRUE),
+        kurt = e1071::kurtosis(RunningTime, na.rm = TRUE),
+        .groups = "drop"
+    ) |>
+    mutate(
+        data_source = "TTC Streetcar",
+        label = paste0("TTC ", Direction)
+    )
+
+bt_moments <- travel_data |>
+    group_by(result_id, period, time_of_day) |>
+    summarise(
+        skew = e1071::skewness(tt, na.rm = TRUE),
+        kurt = e1071::kurtosis(tt, na.rm = TRUE),
+        .groups = "drop"
+    ) |>
+    mutate(
+        data_source = "General Traffic",
+        label = result_id
+    )
+
+cf_data <- bind_rows(ttc_moments, bt_moments) |>
+    mutate(
+        skew_sq = skew^2,
+        # Create a specific column for ggrepel: NA for traffic, Text for TTC
+        repel_label = if_else(data_source == "TTC Streetcar", label, NA_character_)
+    ) |>
+    filter(!is.na(skew_sq), !is.na(kurt))
+
+# levels(cf_data$period)
+```
+
+```{r}
+#| label: fig-cf-graph
+#| echo: false
+#| fig-cap: "Cullen-Frey graph showing pre- and post-treatment skewness and excess kurtosis for all Bluetooth sensor pair segment travel times and streetcar travel times by time of day. Zoomed in to better parse the central clusters."
+#| fig-width: 6.5
+#| fig-height: 4.5
+
+library(ggrepel)
+
+plot_cf <- ggplot(cf_data, aes(x = skew_sq, y = kurt)) +
+    geom_abline(intercept = -2, slope = 1, linetype = "dashed", colour = "grey70") +
+    geom_point(aes(colour = period, shape = data_source), size = 3.5, alpha = 0.7) +
+
+    geom_text_repel(
+        data = cf_data, # Use the full dataset so it 'sees' all collision obstacles!
+        aes(label = repel_label, colour = period),
+        size = 3.5,
+        box.padding = 0.8,       # Slightly reduced to allow labels more movement freedom
+        point.padding = 0.4,     # Ensures the line stops before piercing the point
+        force = 10,              # Massive increase to the magnetic repulsion between labels
+        min.segment.length = 0,
+        segment.colour = "grey30",
+        arrow = arrow(length = unit(0.015, "npc")),
+        show.legend = FALSE,
+        fontface = "bold",
+        max.overlaps = Inf,
+        seed = 2001          # Prevent it from hiding overlapping labels
+    ) +
+    facet_wrap(~ time_of_day, ncol = 3) +
+    scale_colour_manual(
+        values = c("Pre-Treatment" = ttc_blue, "Post-Treatment" = ttc_red),
+        na.translate = FALSE
+    ) +
+    scale_shape_manual(
+        values = c("TTC Streetcar" = 17, "General Traffic" = 16),
+        na.translate = FALSE
+    ) +
+    coord_cartesian(xlim = c(0, 200), ylim = c(-2, 400)) +
+    labs(
+        x = expression("Square of Skewness (" * S^2 *")"),
+        y = "Excess Kurtosis",
+        colour = "Period",
+        shape = "Data Source"
+    ) +
+    guides(
+        colour = guide_legend(override.aes = list(shape = 15, size = 5, alpha = 1)),
+        shape = guide_legend(override.aes = list(colour = "grey40", size = 4))
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 12),
+        panel.border = element_rect(colour = "grey90", fill = NA)
+    )
+
+plot_cf
+```
+
+The Cullen-Frey graph shown in @fig-cf-graph summarises the third and fourth standardized moments. Notably, the streetcar distributions show *higher* excess kurtosis and skewness after the treatment, even when @fig-streetcar-tts shows the tail densities plummeting. I suspect this might be a result of the treatment affecting most typical trip events and so lowering travel time means and variances, but not affecting rarer extreme events like a medical emergency, technical failure, or major road blockage. These extreme events become "farther away" from most typical trips after the treatment, resulting in higher skewness and kurtosis. This also means that changes in the higher moments found in the regression cannot be read in isolation either.
+
+These also directly contradict a naïve assumption about policies like transit priority, that they make transit travel times "more normal". These shifts in the skewness and excess kurtosis show additional evidence for the need to account for them in the response. Simpler one- or two-parameter approaches may also lead to overoptimistic conclusions about the risk of extreme events after policies like this.
+
+### Segment Correlations {#sec-segment-corr}
+
+```{r}
+#| label: prep-corr-mat
+#| echo: false
+
+library(ggcorrplot)
+
+# Filter to Pre-treatment general traffic and pivot wider
+donor_pool <- travel_data |>
+    filter(period == "Pre-Treatment") |>
+    select(datetime_bin, result_id, pace) |>
+    pivot_wider(
+        names_from = result_id,
+        values_from = pace,
+        values_fn = mean
+    ) |>
+    select(-datetime_bin)
+
+# Calculating pairwise Correlation
+corr_matrix <- cor(donor_pool, use = "pairwise.complete.obs", method = "pearson")
+```
+
+```{r}
+#| label: fig-corr-mat
+#| echo: false
+#| fig-cap: "Pre-treatment temporal multicollinearity, hierarchically clustered by `ggcorrplot()` across 138 Bluetooth sensor pair segments."
+#| fig-width: 6.5
+#| fig-height: 6
+
+plot_corr <- ggcorrplot(
+    corr_matrix,
+    hc.order = TRUE,
+    # type = "lower",
+    outline.color = "white",
+    colors = c("steelblue", "white", "#DA291C"),
+    # lab = FALSE,
+    legend.title = "Pearson's r",
+    show.diag = FALSE
+) +
+    theme(
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        legend.title = element_text(face = "bold"),
+        legend.position = "bottom"
+    )
+
+plot_corr
+```
+
+@fig-corr-mat is the correlation matrix of pre-treatment pace (s/100m), clustered together using `stats::hclust` through `ggcorrplot()`. These show clear pockets of multicollinearity among the bluetooth sensor pair segments, which can make the weight split between highly collinear segments very sensitive to random noise [@abadie2021lhour]. This motivates the L2 (ridge) penalty I have in mind for this DSCM implementation to better distribute weights across correlated donors.
+
+That this collinearity appears to be *local* rather than pervasive may indicate a large enough pool of non-redundant donors I can use to construct a good synthetic control.
+
+### Cross-Modal Proxy {#sec-cross-modal}
+
+```{r}
+#| label: prep-mode-corr
+#| echo: false
+
+# 1. Defining intersecting streets on treatment corridor to filter segments
+king_ints <- c("Jarvis", "Yonge", "University", "Spadina", "Bathurst")
+king_segments <- segments |>
+    filter(
+        street == "King",
+        from_inter %in% king_ints,
+        to_interse %in% king_ints
+    )
+
+
+# 2. Processing TTC Streetcar data
+ttc_agg <- ttc_tts |>
+  mutate(
+    dt_start = ymd_hms(paste0(ObservedDate, "T", TripTime)),
+    time_bucket = floor_date(dt_start, "30 mins")
+  ) |>
+  filter(RunningTime > 0, time_bucket < ymd("2017-11-12")) |>
+  summarise(
+    mean_streetcar_time = mean(RunningTime, na.rm = TRUE),
+    streetcar_trips = n(),
+    .by = c("time_bucket", "Direction")
+  )
+
+# 3. Processing Bluetooth General Traffic data
+bt_agg <- bt_tts |>
+  inner_join(
+    st_drop_geometry(king_segments) |> select(segment_na, direction), 
+    by = join_by(result_id == segment_na)
+  ) |>
+  mutate(
+    time_bucket = floor_date(datetime_bin, "30 mins"),
+    Direction = case_when(
+      direction == "EB" ~ "EAST",
+      direction == "WB" ~ "WEST",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(time_bucket < ymd("2017-11-12")) |>
+  # STEP 1: Mean travel time for each individual segment
+  summarise(
+    mean_seg_time = mean(tt, na.rm = TRUE),
+    .by = c("time_bucket", "result_id", "Direction")
+  ) |>
+  # STEP 2: Sum segment times to get the total corridor time
+  summarise(
+    total_traffic_time = sum(mean_seg_time, na.rm = TRUE) / 60,
+    n_segments = n(),
+    .by = c("time_bucket", Direction)
+  ) |>
+  filter(n_segments == 4)
+
+
+king_tts <- inner_join(
+    ttc_agg, bt_agg,
+    by = join_by(time_bucket, Direction)
+)
+
+corr_results <- king_tts |>
+  summarise(
+    pearson_r = cor(
+      mean_streetcar_time,
+      total_traffic_time,
+      use = "pairwise.complete.obs",
+      method = "pearson"
+    ),
+    # time_buckets = n(),
+    .by = "Direction"
+  ) |>
+  pivot_wider(
+    names_from = Direction,
+    values_from = pearson_r
+  )
+```
+
+```{r}
+#| label: fig-mode-corr
+#| echo: false
+#| fig-cap: "Cross-modal travel time correlation (pre-treatment) on King Street between Bathurst and Jarvis Streets."
+
+king_tts |>
+  ggplot(aes(x = total_traffic_time, y = mean_streetcar_time)) +
+  # Point alpha helps show density where many buckets had similar traffic
+  geom_point(alpha = 0.3, colour = "#004c9b", size = 1.5) +
+  # A linear model line directly visualises the Pearson relationship
+  geom_smooth(method = "lm", colour = "#da291c", se = FALSE, linewidth = 1.2) +
+  facet_wrap(~ Direction, ncol = 2) +
+  labs(
+    x = "General Traffic Travel Time (minutes)",
+    y = "TTC Streetcar Travel Time (minutes)"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank()
+  )
+```
+
+TTC streetcar travel times are only provided for the treated corridor, and so I will have to rely on the general traffic travel times in the synthetic control counterfactual. I expect general traffic travel times and streetcar travel times on the same street in mixed traffic to be highly correlated because they're quite literally part of the same traffic flow. The counterfactual is streetcars remaining in mixed traffic, and affected by the same phenomena as regular traffic like weather events, temporal patterns, city-wide events, etc. So, the Bluetooth travel times should be good enough proxies to model the counterfactual I think.
+
+I check the correlation between the streetcar travel times and general traffic travel times across the treated corridor between Bathurst and Jarvis streets, organized into 30 min buckets, and in both directions. I plot them in @fig-mode-corr, and the Pearson correlation coefficients for the East and West directions are `r round(corr_results$EAST[1], 3)` and `r round(corr_results$WEST[1], 3)`, respectively.
+
+### Pace Changes Mapped
+
+```{r}
+#| label: prep-pace-map
+#| echo: false
+
+# Calculating change in mean pace and standard deviation
+pace_stats <- travel_data |>
+    group_by(result_id, period) |>
+    summarise(
+        mean_pace = mean(pace, na.rm = TRUE),
+        sd_pace = sd(pace, na.rm = TRUE),
+        .groups = "drop"
+    ) |>
+    pivot_wider(names_from = period, values_from = c(mean_pace, sd_pace)) |>
+    mutate(
+        delta_mean = `mean_pace_Post-Treatment` - `mean_pace_Pre-Treatment`,
+        delta_sd = `sd_pace_Post-Treatment` - `sd_pace_Pre-Treatment`
+    ) |>
+    filter(!is.na(delta_mean), !is.na(delta_sd))
+
+# Joining with geometries
+map_data <- segments |>
+    select(result_id = segment_na, geometry) |>
+    inner_join(pace_stats, by = "result_id")
+```
+
+```{r}
+#| label: fig-pace-map
+#| echo: false
+#| fig-cap: "Change in general traffic mean pace and pace standard deviation across all Bluetooth sensor pair segments. "
+
+library(patchwork)
+
+map_mean <- ggplot(data = map_data) +
+    # Drawing segments w mapped colours
+    geom_sf(aes(colour = delta_mean), linewidth = 1.2, alpha = 1) +
+    scale_colour_gradient2(
+        low = ttc_blue, mid = "grey90", high = ttc_red, midpoint = 0,
+        name = "Mean Shift\n(s/100m)"
+    ) +
+    theme_void() +
+    theme(legend.position = "right")
+
+map_sd <- ggplot(data = map_data) +
+    geom_sf(aes(colour = delta_sd), linewidth = 1.2, alpha = 1) +
+    scale_colour_gradient2(
+        low = ttc_blue, mid = "grey90", high = ttc_red, midpoint = 0,
+        name = "SD Shift\n(s/100m)"
+    ) +
+    theme_void() +
+    theme(legend.position = "right")
+
+map_mean / map_sd
+```
+
+I map the change in mean pace and pace variability from the pre- to post-treatment periods in @fig-pace-map. These show the drop in general traffic travel times on King Street. Fortunately, the pattern does not seem to propagate very far to affect the entire network here either, and the treatment effect seems like it might attenuate quite a bit with distance.
+
+### Global Moran's I {#sec-moran}
+
+```{r}
+#| label: test-moran-delta
+#| echo: false
+
+delta_cents <- st_centroid(map_data)
+coord_delta <- st_coordinates(delta_cents)
+
+W_mat_del <- knn2nb(knearneigh(coord_delta, k = 4)) |>
+    nb2listw(style = "W")
+
+moran_test <- moran.test(delta_cents$delta_mean, W_mat_del)
+# print(moran_del_mean)
+
+# Extract values from the test object (assuming it is named moran_test_delta)
+moran_i <- round(moran_test$estimate[1], 3)
+moran_z <- round(moran_test$statistic, 2)
+moran_p <- format.pval(moran_test$p.value, eps = 0.001)
+
+# Format p-value string for clean LaTeX rendering
+p_string <- if(grepl("<", moran_p)) moran_p else paste0("= ", moran_p)
+```
+
+A Global Moran's $I$ test was evaluated on the mean pace shift ($\Delta$ pace) between the two periods. The results showed significant positive autocorrelation ($I = `r moran_i`$, $z = `r moran_z`$, $p `r p_string`$). The row-standardized spatial weights matrix was built from each segment's four nearest neighbours. Positive correlation indicates clustering and negative correlation indicates even arrangement; the null hypothesis is random arrangement in space. These results lend additional support for the utility of the L2 penalty for the synthetic control weights and to account for spatial interactions. I also previously tested the pre-treatment mean pace and the SD shift, both of which were statistically significant as well.
+
+### Distribution Screening {#sec-dist-screening}
+
+I used `gamlss::fitDist()` to test fits for the positive continuous families in the `"realplus"` set to the pace of each cell. This was done in a separate R script because the processing time to fit the distributions on all cells took around 30 minutes, and I am only loading the saved results in this document. These cells are pooled streetcar and general traffic times, grouped by period and time of day, with a small set of single-segment cells. The best fit was selected by BIC to penalize the large sample sizes for some of the cells and to guard against overselecting for complexity. The BIC-selected results are shown in @tbl-fitDist-results and are consistent with the AIC results I ran before as well.
+
+```{r}
+#| label: tbl-fitDist-results
+#| echo: false
+#| tbl-cap: "Distributional fits under Bayesian Information Criterion (BIC) penalty. Models were fitted using `gamlss::fitDist()` and setting the Generalized AIC penalty argument to `k = log(n)`. The winning distributions are overwhelmingly dominated by four-parameter families even when selected by BIC."
+#| tbl-pos: "H"
+
+library(knitr)
+library(kableExtra)
+
+dist_results <- read_csv("data/processed/dist_fits_bic.csv")
+
+dist_results |>
+    select(data_source, period, time_of_day, family_short, family_full, bic) |>
+    mutate(
+        bic = formatC(bic, format = "f", digits = 0, big.mark = ","),
+        family_full = str_remove(family_full, " \\(.*")
+    ) |>
+    rename(
+        `Data Source` = data_source,
+        `Period` = period,
+        `Time of Day` = time_of_day,
+        `Distribution` = family_short,
+        `Family Name` = family_full,
+        `BIC` = bic
+    ) |>
+    kable(
+        format = "latex",
+        booktabs = TRUE,
+        linesep = ""
+    ) |>
+    kable_styling(
+        latex_options = c("striped", "scale_down"),
+        stripe_color = "gray!6"
+    )
+
+
+```
+
+Four-parameter families fit the best in nearly every cell. These families included the Box-Cox $t$ (BCT), Box-Cox power-exponential (BCPE), and the Generalized beta type 2 distributions. This holds for the single-segment cells as well. Only the smallest cell (Richmond St, n = 1085) selects a three-parameter family the Generalised Inverse Gaussian (GIG). Despite its straightforward mechanistic "first-passage-time" interpretation the two-parameter Inverse Gaussian is decisively outperformed by more flexible four-parameter families. Exactly which family I will use in the regression will be determined later.
+
+## Data Structure and Integration Plan
+
+The Bluetooth sensor general traffic travel times, and the disaggregated TTC streetcar travel times datasets are structured, tabular datasets. The Detailed Bluetooth Travel Times form a segment-by-time panel: each observation is one sensor-pair segment observed in a five-minute interval, with segment IDs linking to the segment geospatial shapefile (SHP) containing the geometries. They're joined here on the panel data observation `result_id` to `segment_na` in the geospatial file. The TTC Disaggregate Travel Times are trip-level observations measured over a single fixed origin-destination pair bounding the treated King Street corridor — King Street West at Bathurst Street (BKIN) and King Street East at Jarvis Street (KGJV). So, the streetcar data observational unit is a single trip on a consistent single spatial unit. The disaggregate headways which I don't currently use here, are also trip-level but recorded at a single mid-corridor stop (St Andrews Station).
+
+All series are aligned temporally to pre- and post-treatment periods and time-of-day buckets based on the grouping defined in the disaggregated streetcar travel times dataset:
+
+-   "`0-EARLY`": 3am - 7am
+-   "`1-AM`": 7am - 10am
+-   "`2-MID`": 10am - 4pm
+-   "`3-PM`": 4pm - 7pm
+-   "`4-EVENING`": 7pm - 10pm
+-   "`5-LATE`": 10pm -
+
+Morning peak is set to group 1 above, 7am to 10am, and the PM peak is set to group 3 from 4pm to 7pm. The synthetic control weight computation and the regression modelling stages will require reconciling the two different temporal units in the two travel times datasets. Relational joins are performed using `dplyr` tools and spatial joins using `sf`.
+
+## Constraints and Limitations
+
+The most consequential constraints might be related to the donor pool for the synthetic control. An interference-aware synthetic control requires donors that are untreated and uncontaminated by the pilot's spillover, since a contaminated donor no longer represents a no-treatment counterfactual [@grossi2023]. The exploratory evidence is encouraging; the interference range appears like it may be small and so preserves most of the independent donors, but this buffer still needs to be formalized.
+
+Another consequence of the interference-aware synthetic control is that the donor segments that are expected to be the best matches for the treated corridor because of similar spatial conditions, also the most likely to be contaminated because of that proximity. This will limit the best matches available in the donor pool. The explicit interference assumption will only be applied to a few representative segments near the treated corridor, not mapped across the network, simplifying the analysis.
+
+The disaggregate streetcar data only covers the King Street corridor, so I cannot use other streetcar trip observations to use in the counterfactual donor pool. The counterfactual of the transit outcome will therefore have to rely on a cross-modal design with the Bluetooth general traffic travel times.
+
+The treatment was also not static: transit signal priority was disabled at launch and reactivated in July 2018, and the overall route schedule was later restructured [@toronto2019a; @munro2023], so any simple before/after contrast blends the two different treatment regimes.
+
+For a few other caveats, the Bluetooth travel times are only drawn from the subset of Bluetooth equipped vehicles rather than all traffic. The higher statistical moments are also highly sensitive to a small number of extreme observations, as the Cullen-Frey Graph makes clear with its need to cut out quite a few observations for plotting. Those extremes might reflect genuinely rare events or measurement artifacts, although the city's team appears to have been thorough in cleaning the datasets of measurement issues before publishing them.
+
+## Privacy Check
+
+Since there is no personally-identifiable information in these datasets (PII), I don't anticipate any privacy-related issues. The Bluetooth detections are aggregated in 5-minute buckets with no individual identifiers retained, and the streetcar data are aggregated operational records governed by the Open Government License - Toronto. Because the data capture aggregate vehicle and transit operations rather than identifiable individuals and the project does not involve any intervention on human subjects, the human-subject provisions in the Tri-Council Policy Statement are not a concern.
+
+# Architecture and Logic
+
+This section describes how the project will move from the raw City datasets to answering the research questions. Each stage traces back to a limitation of the baseline that the design is designed to overcome, or to a property of the data found in the initial exploratory analysis. Beginning from a `mermaid` flowchart, through to the sequence of operations and dependencies, to the processing pipeline, and then the modelling strategy.
+
+## Visual Pipeline Diagram {#sec-pipeline}
+
+```{mermaid}
+%%| label: fig-pipeline
+%%| echo: false
+%%| fig-cap: "End-to-end analytical pipeline, from raw City of Toronto datasets to distributional treatment-effect estimates. Each modelling stage consumes the output of the preceding stage; the dashed components denote elements deferred to the modelling phase."
+%%| fig-width: 6
+
+
+flowchart TB
+    subgraph S1["1 · Data Sources"]
+        A1["Bluetooth Travel Times<br/>(segment × 5-min)"]
+        A2["TTC Disaggregate<br/>Travel Times (trip-level)"]
+        A3["Centreline Network<br/>Geometry (sf)"]
+        A4["Bluetooth<br/>Segments"]
+    end
+
+    subgraph S2["2 · Preprocessing"]
+        B1["Clean: drop invalid /<br/>impossible records"]
+        B2["Pace normalisation<br/>(inverse speed, s/100m)"]
+        B3["Temporal features:<br/>period, regime, time-of-day"]
+        B4["Spatial join to<br/>Centreline geometry"]
+        B5["Donor-pool construction<br/>+ spatial filtering"]
+    end
+
+    subgraph S3["3 · Modelling"]
+        C1["Temporal DSCM<br/>(L2-regularised,<br/>aggregated objective)"]
+        C2["Counterfactual<br/>distributions"]
+        C3["Bayesian distributional<br/>regression<br/>(4-parameter response)"]
+        C4["Spatial / network<br/>spillover component"]
+    end
+
+    subgraph S4["4 · Outputs"]
+        D1["Distributional treatment<br/>effects (RQ1)"]
+        D2["Spillover estimates<br/>(RQ2)"]
+        D3["Peak / off-peak<br/>heterogeneity (RQ3)"]
+        D4["Quantile-based<br/>reporting"]
+    end
+
+    A1 --> B1
+    A2 --> B1
+    A1 --> B4
+    A3 --> B4
+    A4 --> B4
+    B1 --> B2 --> B3
+    B4 --> B5
+    B3 --> B5
+    B5 --> C1 --> C2 --> C3
+    C4 -.-> C3
+    C3 --> D1
+    C3 --> D3
+    C4 -.-> D2
+    C3 --> D4
+```
+
+The pipeline shown in @fig-pipeline has four main groups. The first describes the raw inputs: the segment level Bluetooth travel times, the Bluetooth geospatial data, the trip-level TTC streetcar travel times, and the Centreline network geometry. The other datasets like the Intersections geospatial file and the King St Traffic and Pedestrian Volumes might be used depending on whether synthetic controls can be constructed for the selected spillover segment sample as in the @grossi2023 methodology, or if I will need to take an alternative approach like a spatial autoregression term. The key decisions in the latter case will be in how to construct the spatial weights matrix from the flow data and in finding a tool that can incorporate it.
+
+The second group processes these datasets into compatible structures, including aligning the TTC streetcar trips into panel data compatible with the bluetooth travel times, normalizing travel times to pace (inverse speed), preparing the temporal and treatment regime features, and constructing the filtered synthetic control donor pool. The third group contains the modelling components, beginning with constructing the distributional synthetic controls and tuning the L2 penalty. The spatial component is tentatively likely to be constructing synthetic controls for affected spillover segments but subject to change if not feasible. These are then fed into the distributional regression framework which will likely be `bamlss` for its modularity, flexibility, and ability to model conditional responses to all parameters in a four-parameter distribution. The last group describes the final target outputs, including the components necessary to answer the research questions and enable comparisons with the baselines.
+
+## Sequence of Operations {#sec-sequence}
+
+First, the *cleaning and validation* removes records that are not physically possible like non-positive travel times. Second, *pace normalization* converts travel times into comparable inverse speed (seconds per 100 metres). This is necessary for any cross-segment or corridor comparison or distribution fitting, because the Bluetooth sensor pair segments do not have consistent lengths. Third, the *temporal and treatment regime* features are fixed, so the pre-/post-treatment indicators, the treatment regime change, time of day partitions, and appropriate bucketing for the DSCM and regression stages. Fourth, aligning the streetcar trip-level observations with the segment buckets and the appropriate larger bucketing for the DSCM weight estimation.
+
+Fifth, the *spatial join* to the Centreline geometry and the *donor-pool construction* occur together because determining the range of the spillover and an appropriate selection of spillover segments to sample requires the geometry. The donor pool must be settled to construct the synthetic controls. Sixth, the *L2-regularized DSCM* is fitting on the pre-treatment panel to minimize the 2-Wasserstein distance between the donor mixture and the streetcar corridor. Lastly, the *Bayesian distributional regression* is fitted with the synthetic controls produced from the previous step.
+
+The core assumption for the synthetic control is that an untreated donor's observed post-treatment outcome can represent the no-treatment counterfactual. More specifically, a weighted mixture of donor units that are unaffected by the treatment [@abadie2021]. The donor pool filtering is therefore a critical safeguard for a valid counterfactual.
+
+## Preprocessing and Feature Engineering {#sec-features}
+
+**Cleaning and missingness.** Records with impossible travel times are removed. Travel times will not be imputed either. The analysis target is the *distribution* of travel times rather than a time series of the expected value, and so preserving the information contained in the heavy tails is necessary for adequately modelling these extremes. There are gaps in the panel data, however, often overnight or in occasional periods, which are just treated as a coverage limitation and not imputed. The City's team appears to have cleaned the dataset from measurement errors quite a bit before publishing, so outlying travel times are retained rather than trimmed because the upper tail and these extreme events *are* the reliability signal.
+
+**Pace normalization.** Travel times are converted to inverse speed/pace (seconds per 100 metres), since the Bluetooth segments vary in length and the streetcar and Bluetooth measurements span different physical spaces. Normalization makes segments and the two modes comparable on a common scale. One possible exception would be if the streetcar travel times live too far outside the distribution of general traffic travel times, and so might need donors scaled up before applying weights, a crude approximation of a more flexible synthetic control weighting framework that relaxes the probability simplex constraint.
+
+**Temporal and treatment features.** A pre-/post-treatment indicator marks the 12 November 2017 launch, and another marker is place in July 2018 to indicate the reactivation of the transit signal priority and route restructuring. This will enable a more nuanced and precise treatment effect without blending the two regimes. A time of day factor following the City's own definitions established in the dataset will define the separate regressions, enabling me to answer research question 3.
+
+**Spatial features and donor pool construction.** The cross-modal proxy was validated in @sec-cross-modal, indicating general traffic segments can serve as donors for the untreated transit counterfactual that still lives in a mixed traffic context. The spatial information will be needed for determining nearby spillover candidates and for filtering the donor pool. The Moran's I tests in @sec-moran indicate the need to account for the spatial interactions.
+
+**Feature engineering.** Because the project compares alternative synthetic control formulations from the L2 regularized implementation proposed for this project, and existing tools, the L2 penalty tuning will include comparisons against other existing tools. Critically, the synthetic control is only derived from pre-treatment data so that treatment information is not leaked into the control weights.
+
+## Modelling and Evaluation Strategy {#sec-modelling}
+
+**Inputs and outputs.** The modelling stage has settled and deferred components. The proposed distributional synthetic control implementation (@sec-gap) takes the pre-treatment pace distributions of the treated corridor and the donor segment mixture and returns a vector of weights that when applied to the donor pool, simulates the counterfactual of the matched distribution into the post-treatment period, as if the pilot had not occurred. The Bayesian distributional regression via `bamlss` then takes the treated and counterfactual data and models the full response distribution as a function of the covariates, returning posterior distributions for the four parameters ($\mu$, $\sigma$, $\nu$, $\tau$). The spatial/network component is not confidently settled yet, and will depend on the quality of the synthetic controls in the modelling stage. All of these together address the three research questions, from the distributional effects (RQ1), the network interference and spillover effects (RQ2), and peak/off-peak heterogeneity (RQ3).
+
+**Remaining implementations and decisions.** The proposed L2-regularized DSCM will be implemented as part of this project. The gradient-descent optimization and the projection onto the simplex constraint will be learning goals of mine and remain to be written. The objective function specified by @eq-statz-dscm defines the target, but the numerical method and optimization is not yet built.
+
+The *response distribution* is also left undetermined at the moment. The distribution screening using `gamlss::fitDist()` in @sec-dist-screening established decisively that a four-parameter family will be necessary, and identifies the Box-Cox $t$ (BCT), Box-Cox power exponential (BCPE), and generalised beta type 2 (GB2) as the leading candidates. I will need to learn more about each family and their suitability for the goals of this analysis before I can comfortably settle this question.
+
+**Comparing alternatives.** The proposed DSCM weighting will be compared against the existing standard averaged-weights procedure and against the non-distributional expected-value-based synthetic controls. Pre-treatment fit is the primary goal, likely measured by held out 2-Wasserstein distance.
+
+**Validation and leakage prevention.** Because these are panel data, validation and leakage prevention is achieved by respecting that temporal structure. The synthetic control tuning is evaluated on a temporal train-test split with the test set being a window occurring after the training set. The synthetic control weights are also only computed from the pre-treatment period to prevent treatment information leaking into the simulated counterfactual. The cross-modal proxy was also validated on pre-treatment observations.
+
+**Reporting interpretability.** The standard moments will also be reported through more interpretable quantile metrics similar to the baselines (@sec-baseline), like changes in mean, median, and upper percentiles, in their original units. This approach gets the best of both worlds, using the whole distribution to inform the conditional parameter values, while being easily understandable and comparable against the existing but simpler analyses.
+
+# Reproducibility and Version Control
+
+The full analysis pipeline, source documents, and supporting R scripts are maintained in a public GitHub [repository](https://github.com/zachdaulat/king-st-case-study). The repo describes the structure, dataset download instructions due to their large sizes, and installation instructions for the `statz` package. The `data/processed/` directory contains small intermediate saved datasets or processing results like the distribution fittings. The `gamlss::fitDist()` pipeline was done in a separate R script in `R/`. The rest of the exploratory analysis code sits in the Quarto Markdown (`.qmd`) source file of this document and is executed upon document compilation.
+
+# GenAI Use Declaration
+
+The Generative AI models I used in this project were Claude Opus 4.8 and Gemini 3.1, and they were used for the following purposes:
+
+**Visualization code and debugging:**
+
+The `ggplot2` and `mermaid` code for the plots and flowchart, respectively, were usually initially drafted by the LLM and then refined either manually or by followup prompts to achieve the kind of structure and visual design I had in mind. This enabled me to focus on the design and communicating the information without getting caught up in needing to learn all of the syntax-related idiosyncrasies of either framework. It was also used for help in formatting the distribution screening results in @tbl-fitDist-results with `knitr::kable()` and the `kableExtra` package.
+
+Less commonly, they were also used to debug `dplyr` pipelines or other R code. More often I wrote the logic myself since it was quicker for the dataset structures, to correct errors, or change to more modern `tidyverse` conventions.
+
+**Tool and layout troubleshooting:**
+
+The LLMs were useful in helping to troubleshoot issues with Quarto and LaTeX rendering to achieve the PDF layout and formatting I had in mind. For example, the landscape orientation needed to display @fig-traffic-tts cleanly, properly set the execution directory in the `_quarto.yml` file so the paths I write are relative to the Git-tracked project directory instead of the Milestone directory, and to properly set the monospaced font. It was also used to generate the LaTeX math with refinements as needed to ensure the notation was correct.
+
+**Learning resource:**
+
+I used LLMs as a learning resource as well, as one part of the literature search and for learning a given concept or technique. To perform the literature search I used the Claude research tool to get a broad exploration of easily accessible source. I also performed manual searches on google scholar, the TMU library's Omni tool, and the City of Toronto's published resources since they're easier for me to navigate myself. I make sure to check sources just in case, because the initial pass through of the Gunsilius DSCM implementation missed the averaged weights formulation, for example.
+
+I've also used LLMs to teach me and work through learning a particular concept, starting from the initial explanation and walkthrough, to my followups asking clarifying questions, and implications and connections that come to mind. For example, while I have some basic linear algebra and computing knowledge, I will be using it to learn the gradient descent and simplex projection algorithm that will be minimizing the objective function in @eq-statz-dscm. These also include finding and learning additional R packages to accomplish the analytical goals of the project.
+
+**Sounding board:**
+
+I've also found LLMs to be useful as a "conceptual sounding board" of sorts. I would be exploring some concept or analytical approach, fleshing it out to some level of specificity as far as I can, and then use the model as a check for confirming, fleshing out, or correcting my own thinking as a check against it. This is how I arrived at adding the L2 regularization, when I was thinking about the risks of a donor pool with significant multicollinearity and near rank deficiency, and the feasibility of adding something like an L2 penalty to distributional synthetic controls, given I've seen it applied to regular scalar SCM but not the distributional version.
+
+Another example was that I was thinking to report the higher statistical moments of the segment and streetcar distributions and their changes, but I didn't know of how to best do it. This is how I arrived at using a Cullen-Frey graph in @fig-cf-graph. 
+
+**Limitations of use:**
+
+All core architectural decisions, code execution, statistical test execution, and drafting the narrative were done by me. I did use GenAI as a spellchecker and to proofread for conceptual consistency, since I wrote sections at different parts of the analysis and I didn't capture every change on the first review pass. Every piece of code, mathematical reasoning, or methodological design decision described in this report was thoroughly reviewed, verified, and manually integrated by me into the `.qmd` source file.
+
+\newpage
+
+# References
+
+::: {#refs}
+:::

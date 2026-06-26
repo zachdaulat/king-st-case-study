@@ -1,0 +1,31 @@
+project:
+  title: "Milestone 2: Interim Report"
+
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    colorlinks: true
+    classoption: [titlepage]
+    keep-tex: true
+    header-includes:
+      - '\KOMAoption{captions}{tableheading}'
+      - '\usepackage{colortbl}'
+      - '\usepackage{pdflscape}'
+    monofont: "Fira Code"
+    monofontoptions: 
+      - Scale=MatchLowercase
+      - Contextuals=Alternate
+
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+
+knitr: 
+  opts_knit: 
+    root.dir: "../../"
+
+bibliography: references.bib
+csl: apa.csl
