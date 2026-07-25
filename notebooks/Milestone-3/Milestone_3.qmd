@@ -1,0 +1,1387 @@
+---
+title: "Milestone 3: Initial Results"
+subtitle: "CIND820: Big Data Analytics Project"
+author:
+  - "Zachary Daulat (Student ID: 501210116)"
+  - "**Supervisor:** Dr. Ceni Babaoglu"
+date: last-modified
+---
+
+# Introduction {#sec-intro}
+
+This milestone presents initial modelling results for a causal-inference evaluation of the City of Toronto's King Street Transit Priority Pilot, launched on 12 November 2017 between Bathurst and Jarvis Streets [@toronto2019]. The analysis addresses three research questions, unchanged since Milestone 1:
+
+1.  Whether the pilot improved transit speed and reliability
+2.  Whether any improvement on King Street came at the expense of nearby parallel streets through redirected traffic; and,
+3.  Whether effects differed between peak and off-peak periods
+
+The methodological design, motivated in detail in the Milestone 2 interim report, constructs a counterfactual using a *distributional synthetic control* (DSC) rather than conventional mean-matching synthetic control. "Reliability" is fundamentally a statement about the *shape* of the travel-time distribution — its spread and tail behaviour, not only its centre — so the counterfactual must reproduce whole distributions rather than means.
+
+The design differs from and extends the distributional synthetic control of @gunsilius2023 in three ways: a single donor-weight vector is fitted against the aggregated pre-treatment 2-Wasserstein distances across time buckets rather than averaging bucket-specific weights; an L2 ridge penalty stabilizes the donor pool weights against the strong collinearity expected among sequential donors on a shared corridor; and an offset constant that shifts the donor pool barycenter to better match the treated units center. This method is implemented as `z_dsc()` in the [`statz`](https://github.com/zachdaulat/statz#dsc) R package. The third refinement I explain and motivate in more detail below in @sec-dsc-method and @sec-centering.
+
+This document reports a *proof of concept* to demonstrate that the full pipeline — preprocessing, distributional synthetic control construction, and Bayesian distributional regression — executes end to end and produces interpretable results on a treated unit and selected spillover candidates. Hyperparameter tuning, bootstrap uncertainty quantification, the full spillover analysis, and external benchmarking against existing implementations are deferred and described in the Next Steps (@sec-next-steps). The remainder of the document is organized around the milestone's task structure: data analysis and preparation (@sec-data), model development and evaluation (@sec-modelling), the validation protocol (@sec-validation), reproducibility (@sec-reproducibility), and next steps.
+
+## The `statz` Package {#sec-statz}
+
+The Distributional Synthetic Control Method I propose and use in this project is implemented in the [`statz`](https://github.com/zachdaulat/statz#dsc) R package. To replicate this analysis, `statz` must be installed from source, requiring the Rust toolchain and R build tools. The GitHub repo contains more installation details at <https://github.com/zachdaulat/statz#installation>, like links to the required build tools. Installation can take a couple of minutes.
+
+```{r}
+#| label: statz-install
+#| echo: true
+#| eval: false
+
+# Install from GitHub Repo
+pak::pkg_install("zachdaulat/statz")
+```
+
+# Data Analysis and Preparation {#sec-data}
+
+```{r}
+#| label: load-libraries
+#| include: false
+
+library(tidyverse)
+library(tidymodels)
+library(sf)
+```
+
+```{r}
+#| label: load-data
+#| echo: false
+
+segments <- read_sf("data/raw/bluetooth-travel-time-segments-wgs84")
+bt_tts <- bind_rows(
+    read_csv("data/raw/detailed-bluetooth-travel-time-2017.gz"),
+    read_csv("data/raw/detailed-bluetooth-travel-time-2018.gz")
+)
+ttc_tts <- read_csv("data/raw/ttc-disaggregate-travel-times.csv")
+
+write_csv(
+  read_csv("data/raw/detailed-bluetooth-travel-time-2017.gz"),
+  "data/raw/bt_tts.csv"
+)
+```
+
+## Data Sources {#sec-data-sources}
+
+The analysis draws on three datasets published on the City of Toronto Open Data Portal as part of the pilot's own monitoring programme. The **Detailed Bluetooth Travel Time** data form a segment-by-time panel: each observation is one sensor-pair segment observed over a five-minute window, recording the mean travel time (`tt`, in seconds) and the number of vehicles sampled in that window (`obs`). The **Disaggregate Headway and Travel Time** data provide trip-level TTC streetcar running times along the treated corridor. A **segment shapefile** supplies the Bluetooth sensor pair geometries. The full univariate, bivariate, and spatial audit of these datasets appears in the Milestone 2 interim report; this section carries forward only the elements that directly motivate the modelling decisions below.
+
+## Preprocessing Pipeline {#sec-preprocessing}
+
+```{r}
+#| label: prep-bluetooth
+#| echo: true
+
+bt_prep <- bt_tts |>
+  left_join(
+    select(st_drop_geometry(segments), segment_na, length),
+    join_by(result_id == segment_na)
+  ) |>
+  mutate(
+    pace = (tt / length) * 100,
+    post = if_else(datetime_bin >= ymd("2017-11-12"),
+                     "Post-Treatment", "Pre-Treatment"),
+    post = factor(
+      post, 
+      levels = c("Pre-Treatment", "Post-Treatment"),
+      ordered = FALSE
+    ),
+    hod = hour(datetime_bin),
+    tod = case_when(
+      hod >= 7  & hod < 10 ~ "1-AM",
+      hod >= 10 & hod < 16 ~ "2-MID",
+      hod >= 16 & hod < 19 ~ "3-PM",
+      hod >= 17 & hod < 20 ~ "4-EVENING",
+      hod >= 20            ~ "5-LATE",
+      hod <  7             ~ "0-EARLY"
+    ),
+    tod = factor(
+      tod, 
+      levels = c("0-EARLY", "1-AM", "2-MID", "3-PM", "4-EVENING", "5-LATE"),
+      ordered = TRUE
+    )
+  ) |>
+  filter(tt > 0)
+```
+
+Two transformations prepare the data for distributional synthetic control fitting.
+
+**Pace normalization.** Segments differ in physical length, so raw travel time is not comparable across them. Travel times are normalized to *pace*; inverse speed in seconds per 100 metres. Pace is the intended modelling response, but I might reconsider this if the synthetic control fit is poor since the comparison is between the treated unit and its simulated counterfactual.
+
+**Time-of-day banding.** Observations are grouped into the buckets used in the official City and TTC evaluations.
+
+-   `"0-EARLY"`: 3am - 7am
+-   `"1-AM"`: 7am - 10am
+-   `"2-MID"`: 10am - 4pm
+-   `"3-PM"`: 4pm - 7pm
+-   `"4-EVENING"`: 7pm - 10pm
+-   `"5-LATE"`: 10pm -
+
+Adopting the same grouping keeps this analysis directly comparable to the published evaluation, and retains substantially more five-minute means per bucket than hourly bucketing would, mitigating the sparsity of off-peak windows. The tradeoff is greater within-group heterogeneity — a three-hour peak bucket mixes conditions across the peak — so the within-group distribution reflects both genuine short-window variability and some within-group drift. This is an accepted limitation of the aggregation choice and is revisited in (@sec-interpretation). I may combine groups `"0-EARLY"` and `"5-LATE"` if the overnight sparsity is an issue.
+
+The treated streetcar series is trip-level, whereas the donor Bluetooth series observations are means of five-minute windows. This asymmetry is noted in @sec-interpretation, but both remain valid distributional objects and the proxy logic linking mixed-traffic pace to streetcar pace, established in the interim report, is unaffected.
+
+```{r}
+#| label: prep-streetcars
+#| echo: true
+
+ttc_prep <- ttc_tts |>
+  mutate(
+    Direction = factor(Direction, levels = c("EAST", "WEST"), ordered = FALSE),
+    post = if_else(ObservedDate >= ymd("2017-11-12"),
+                     "Post-Treatment", "Pre-Treatment"),
+    post = factor(post, levels = c("Pre-Treatment", "Post-Treatment"), ordered = FALSE),
+    tod = case_when(
+      str_starts(TimePeriod, "0-EARLY")   ~ "0-EARLY",
+      str_starts(TimePeriod, "1-AM")      ~ "1-AM",
+      str_starts(TimePeriod, "2-MID")     ~ "2-MID",
+      str_starts(TimePeriod, "3-PM")      ~ "3-PM",
+      str_starts(TimePeriod, "4-EVENING") ~ "4-EVENING",
+      str_starts(TimePeriod, "5-LATE")    ~ "5-LATE",
+    ),
+    tod = factor(
+      tod, 
+      levels = c("0-EARLY", "1-AM", "2-MID", "3-PM", "4-EVENING", "5-LATE"),
+      ordered = TRUE
+    ),
+    # `Speed` units are km/h
+    pace = 360 / Speed
+  ) |>
+  filter(RunningTime > 0, Speed > 0)
+```
+
+For a similar reason as to why I might reconsider pace as a metric, this might not be an issue because the treated and donor units do not necessarily need to be directly comparable. The causal estimator's comparison is between the treated unit and its own synthetic counterfactual, so the key requirement from donors are high pre-treatment *correlation* to the treated unit.
+
+## Descriptive Statistics and Visualization {#sec-descriptive}
+
+The interim report established that the travel-time distributions can be highly skewed and kurtotic. Distributional screening with `gamlss::fitDist()` done for Milestone 2 shown again here in @tbl-fitdist-results, confirmed that four-parameter families fit best in almost every cell, motivating the four-parameter response family used in the distributional regression (@sec-bamlss).
+
+```{r}
+#| label: tbl-fitdist-results
+#| tbl-cap: "Distributional fits under BIC penalty (reproduced from the Milestone 2 interim report). Four-parameter families dominate across nearly all cells, motivating the four-parameter response used in the distributional regression."
+#| tbl-pos: "H"
+
+library(knitr)
+library(kableExtra)
+
+dist_results <- read_csv("data/processed/dist_fits_bic.csv")
+
+dist_results |>
+  select(data_source, period, time_of_day, family_short, family_full, bic) |>
+  mutate(
+    bic = formatC(bic, format = "f", digits = 0, big.mark = ","),
+    family_full = str_remove(family_full, " \\(.*")
+  ) |>
+  rename(
+    `Data Source` = data_source, `Period` = period,
+    `Time of Day` = time_of_day, `Distribution` = family_short,
+    `Family Name` = family_full, `BIC` = bic
+  ) |>
+  kable(format = "latex", booktabs = TRUE, linesep = "") |>
+  kable_styling(
+    latex_options = c("striped", "scale_down"),
+    stripe_color = "gray!6"
+  )
+```
+
+Two visualizations @fig-streetcar-tts and @fig-traffic-tts from Milestone 2 shows pre- and post-treatment distributions for the treated streetcar corridor alongside a sample of Bluetooth sensor pair segments. Reading these pre/post shifts by segment orientation — parallel-adjacent versus perpendicular or distant — is the basis on which candidates are provisionally classified as spillover-suspect or clean-donor at this stage, pending the flow-informed exposure measure planned for later work.
+
+```{r}
+#| label: fig-streetcar-tts
+#| fig-cap: "TTC streetcar travel time distributions on the King St corridor before and after the policy was activated, in both directions, at different times of day."
+#| fig-width: 6.5
+#| fig-height: 6.5
+
+# "#DA251D"
+ttc_red <- rgb(218, 37, 29, maxColorValue = 255)
+ttc_blue <- "#00B0F0"
+
+plot_ttc <- ggplot(ttc_prep, aes(x = RunningTime, fill = post)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  facet_grid(tod ~ Direction) +
+  scale_fill_manual(values = c("Pre-Treatment" = ttc_blue,"Post-Treatment" = ttc_red)) +
+  # Truncate extreme outliers for a cleaner visual of the main distribution body
+  coord_cartesian(xlim = c(0, 40)) + 
+  labs(
+    x = "Travel Time (minutes)",
+    y = "Density",
+    fill = "Period"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom", 
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+plot_ttc
+```
+
+```{=latex}
+\begin{landscape}
+```
+
+```{r}
+#| label: fig-traffic-tts
+#| fig-cap: "General traffic time reliability across both directions of a perpendicular street to King Street and a select sample of parallel streets to King Street that may be spillover effect candidates. The segments for King Street and streets parallel to it are between Yonge and University. Travel times are normalized to inverse speed/pace (seconds per 100m) because of varying segment lengths."
+#| fig-width: 11
+#| fig-height: 6.5
+
+target_segments <- c(
+    "AD_UN_AD_YO", # Adelaide: Univ to Yonge (EB)
+    "RM_YO_RM_UN", # Richmond: Yonge to Univ (WB)
+    "KN_UN_KN_YO", # King: Univ to Yonge (EB)
+    "KN_YO_KN_UN", # King: Yonge to Univ (WB)
+    "KN_SP_QU_SP", # Spadina: King to Queen (NB)
+    "QU_SP_KN_SP", # Spadina: Queen to King (SB)
+    "DU_YO_DU_UN", # Dundas: Yonge to Univ (WB)
+    "DU_UN_DU_YO", # Dundas: Univ to Yonge (EB)
+    "QU_UN_QU_YO", # Queen: Univ to Yonge (EB)
+    "QU_YO_QU_UN"  # Queen: Yonge to Univ (WB)
+)
+
+bt_sample <- bt_prep |>
+  filter(result_id %in% target_segments) |>
+  mutate(
+    segment_label = case_when(
+      result_id == "KN_UN_KN_YO" ~ "King (EB)",
+      result_id == "KN_YO_KN_UN" ~ "King (WB)",
+      result_id == "AD_UN_AD_YO" ~ "Adelaide (EB)",
+      result_id == "RM_YO_RM_UN" ~ "Richmond (WB)",
+      result_id == "QU_UN_QU_YO" ~ "Queen (EB)",
+      result_id == "QU_YO_QU_UN" ~ "Queen (WB)",
+      result_id == "DU_UN_DU_YO" ~ "Dundas (EB)",
+      result_id == "DU_YO_DU_UN" ~ "Dundas (WB)",
+      result_id == "KN_SP_QU_SP" ~ "Spadina (NB)",
+      result_id == "QU_SP_KN_SP" ~ "Spadina (SB)",
+    ),
+    segment_label = factor(segment_label, levels = c(
+      "King (EB)", "King (WB)",
+      "Adelaide (EB)", "Richmond (WB)",
+      "Queen (EB)", "Queen (WB)",
+      "Dundas (EB)", "Dundas (WB)",
+      "Spadina (NB)", "Spadina (SB)"
+    ))
+  )
+
+plot_bt <- ggplot(bt_sample, aes(x = pace, fill = post)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  # Facet grid allows us to compare segments (columns) across times of day (rows)
+  facet_grid(tod ~ segment_label) + 
+  scale_fill_manual(values = c("Pre-Treatment" = ttc_blue, "Post-Treatment" = ttc_red)) +
+  coord_cartesian(xlim = c(0, 100)) + 
+  labs(
+    x = "Pace (Seconds / 100m)",
+    y = "Density",
+     fill = "Period"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom", 
+    strip.text = element_text(face = "bold")
+  )
+
+plot_bt
+```
+
+```{=latex}
+\end{landscape}
+```
+
+I use the distribution plots above and manual selection based on street network geometry to filter the donor pool from nearby segments that might have experienced spillover effects and therefore would not be independent donors. The ridge plot below in @fig-donor-ridgeline is a feasibility check for the synthetic control, overlaying the treated King Street streetcar distribution against the pre-treatment donor distributions in the PM peak time period (4-7pm). Because the distributional synthetic control constructs the counterfactual as a Wasserstein barycenter, the treated distribution must lie broadly *within the envelope* of the donors rather than outside it. The ridgeline layout makes this immediately legible.
+
+```{r}
+#| label: prep-ridgeline
+
+spillover_segments <- c(
+  "AD_JA_AD_PA", "AD_UN_AD_YO", "AD_YO_AD_JA", "AD_SP_AD_UN", "AD_PA_EA_BV", # Adelaide segments
+  "KN_BA_QU_BA", "QU_BA_KN_BA", "KN_BA_FR_BA", "FR_BA_KN_BA",                # Bathurst segments except King
+  "FR_JA_FR_PA", "FR_YO_FR_JA", "FR_PA_FR_JA", "FR_SP_FR_UN", # Front St segments (most)
+  "FR_UN_FR_SP", "FR_UN_FR_YO", "FR_YO_FR_UN", 
+  "QU_UN_QU_SP", "QU_UN_QU_YO", "QU_YO_QU_JA", "QU_BA_QU_SP", # Queen St, Bathurst to Jarvis 
+  "QU_JA_QU_YO", "QU_YO_QU_UN", "QU_SP_QU_BA", "QU_SP_QU_UN",
+  "KN_SP_FR_SP", "KN_SP_QU_SP", "FR_SP_KN_SP", "QU_SP_KN_SP", # Spadina connecting to King
+  "QU_UN_KN_UN", "KN_UN_FR_UN", "KN_UN_QU_UN", "FR_UN_KN_UN" # University connecting to King
+)
+spillover_streets <- c("King", "Jarvis", "Richmond", "Wellington", "Yonge", "York")
+
+ridge_segments <- st_drop_geometry(segments) |>
+  filter(!segment_na %in% spillover_segments, !street %in% spillover_streets) |>
+  pull(segment_na)
+
+bt_ridge <- bt_prep |>
+  # anti_join(ridge_segments, by = join_by(result_id == segment_na)) |>
+  filter(
+    result_id %in% ridge_segments,
+    post == "Pre-Treatment",
+    tod == "3-PM"
+  )
+
+ttc_ridge <- ttc_prep |>
+  filter(
+    Direction == "WEST",
+    post == "Pre-Treatment",
+    tod == "3-PM"
+  )
+
+data_ridge <- bind_rows(
+  # Target (TTC Streetcars)
+  ttc_ridge |>
+    select(pace) |>
+    mutate(
+      unit = "King St (Target)",
+      status = "Target"
+    ),
+  
+  # Donors (Bluetooth sensor pairs)
+  bt_ridge |>
+    select(pace, result_id) |>
+    rename(unit = result_id) |>
+    mutate(status = "Donor")
+) |>
+  mutate(
+    unit = factor(unit, ordered = FALSE),
+    unit = fct_reorder(unit, pace, .fun = median, na.rm = TRUE),
+    unit = fct_relevel(unit, "King St (Target)", after = Inf)
+  )
+
+```
+
+```{r}
+#| label: fig-donor-ridgeline
+#| fig-cap: "Pre-treatment pace distributions in the PM Peak (westbound): the treated King Street corridor against the candidate donor segments. The treated distribution sitting within the spread of the donor distributions indicates that a Wasserstein barycenter of the donors can plausibly reproduce it."
+#| fig-width: 8
+#| fig-height: 12
+
+library(ggridges)
+
+plot_ridge <- ggplot(
+  data_ridge,
+  aes(x = pace, y = unit, fill = status, colour = status, alpha = status)
+) +
+  geom_density_ridges(scale = 4, rel_min_height = 0.005) +
+
+  # Controling limits to handle outliers
+  coord_cartesian(xlim = c(0, 80)) +
+
+  # Mapping aesthetics for visual hierarchy
+  scale_fill_manual(values = c("Target" = ttc_red, "Donor" = "grey60")) +
+  scale_colour_manual(values = c("Target" = "black", "Donor" = NA)) + # NA removes donor borders
+  scale_alpha_manual(values = c("Target" = 0.9, "Donor" = 0.5)) +
+
+  theme_minimal(base_size = 14) +
+  theme(
+    # Remove all y-axis text and ticks to create the "Envelope" effect
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_blank(),
+    
+    # Remove horizontal grid lines so the ridges float cleanly
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    
+    # Position the legend cleanly
+    legend.position = "right",
+    legend.title = element_blank()
+  ) +
+  labs(
+    # title = "Pre-Treatment Delay Distributions: PM Peak (Westbound)",
+    # subtitle = "King Street Target vs. Candidate Donor Pool Convex Hull",
+    x = "Pace (Seconds per 100m)",
+    # caption = "Donor pool spatially filtered to exclude contiguous spillover segments."
+  )
+
+plot_ridge
+```
+
+This hand filtering is just for the purposes of this check, and I will use a more principled method for the full modelling pipeline; likely based on a combination of the network geometry and traffic flows.
+
+While the treated corridor appears to mostly be within the donor pool envelope, overall the streetcar distribution is systematically slower than most of the donors. If this is an issue, I might refine the objective function to include a mean shift constant so that the weights are focused on fitting the shape of the treated corridor's distribution.
+
+```{r}
+#| label: cleanup-descriptive
+
+rm(bt_ridge, ttc_ridge, data_ridge, bt_sample, target_segments, 
+plot_bt, plot_ttc, plot_ridge, dist_results, bt_tts, ttc_tts)
+```
+
+# Model Development and Evaluation {#sec-modelling}
+
+## Distributional Synthetic Control {#sec-dsc-method}
+
+The counterfactual is constructed with `z_dsc()` from my `statz` package. For each pre-treatment time bucket $b$, the empirical quantile functions of the treated unit and of each donor are evaluated on a shared grid of $Q$ probability levels. `z_dsc()` solves the objective function,
+
+$$
+(\mathbf{w}^*, \alpha^*) \; = \; \underset{\mathbf{w} \in \Delta^{J},\; \alpha \in \mathbb{R}}{\arg\min} \; \frac{1}{Q T_0} \sum_{t=1}^{T_0} \left\| \mathbf{a}^{(t)} - (\alpha \mathbf{1} + D^{(t)}\mathbf{w}) \right\|_2^2 \; + \; \lambda \| \mathbf{w} \|_2^2
+$$
+
+where:
+
+-   $\mathbf{a}^{(t)} \in \mathbb{R}^{Q}$ — the treated unit's empirical quantile function in pre-treatment bucket $t$ evaluated on a grid of $Q$ probability levels
+-   $D^{(t)} \in \mathbb{R}^{Q \times J}$ — $J$ donors' empirical quantile functions in bucket $t$, evaluated on a shared $Q$-point probability grid
+-   $\mathbf{w} = (w_1, \dots, w_J)$ — the donor weight vector, constrained to the probability simplex $\Delta_{J} = \{\mathbf{w} : w_{j} \geq 0,\ \sum_{j} w_{j} = 1\}$
+-   $T_{0}$ is the number of pre-treatment buckets in the time series
+-   $\lambda \geq 0$ is the L2 (ridge) penalty parameter.
+-   $\alpha \in \mathbb{R}$ — a scalar intercept shifting the Wasserstein barycenter
+-   $\mathbf{1} \in \mathbb{R}^{Q}$ — a vector of ones
+
+Like I explained in @sec-intro, three features distinguish this from the existing distributional synthetic control implementation found in the `DiSCos` R package. First, a single weight vector is fitted against the pooled objective across all buckets, rather than fitting per-period weights and averaging them afterwards. Second, the L2 penalty stabilizes the weights when donors are near-collinear, which is expected for sequential Bluetooth segments on a shared corridor with substantially the same traffic. Without it, the weight split and sparsity behaviour between two near-identical donors is determined by sampling noise. Third is the offset constant $\alpha$, which shifts the donor pool barycenter by a fixed constant. I've added $\alpha$ to address the issue that the streetcar times are systematically slower than nearly every donor. I motivate this in more detail below in @sec-centering. This is a temporary implementation, because I expect I will explore changing the $\alpha$ parameter to scale the weighted barycenter instead of shifting it, to better accommodate strictly positive data.
+
+`z_dsc()` accumulates the per-bucket quantile matrices into a Gram matrix and cross-term and solves by projected gradient descent, alternating a gradient step with Euclidean projection back onto the simplex [@duchi2008]. The step size is set from the largest eigenvalue of the Hessian, and the same eigendecomposition supplies donor-pool diagnostics (effective rank, condition number, singular value spectra, all with and without the ridge penalty). Optimizer correctness is cross-validated against `quadprog::solve.QP()` in the package test suite.
+
+### Shape Matching and the Offset {#sec-centering}
+
+@fig-donor-ridgeline shows that while the treated streetcar distribution is broadly within the donor envelope, it sits systematically to the slow side of nearly every donor. This makes sense mechanistically: streetcars dwell at stops and are lane-constrained, so no mixed-traffic donor can be that slow. This mechanistic constraint is particularly apparent in the lower tail where the streetcar times are slower than *every* donor in this pool. The treated distribution's *location* therefore lies at least partially outside nearly all of the donors' convex hull. Only a few donors appear to plausibly match the location (averages pace), but this significantly limits the donors available for matching the shape of the distribution.
+
+This motivates the third refinement to the distributional synthetic controls implementation in `statz`, separating the location and shape matching so that the weight fitting is performed on *centered* distributions. Each unit's pre-treatment mean pace is subtracted from its observations so that the weights are optimized on matching the shape alone, decomposing the Wasserstein distances between the barycenter of donors and the treated unit into location and shape components. The level is recovered after by finding the residual between the synthetic control's mean and the treated unit's mean. The implicit assumption is that this offset between the donor barycenter and the counterfactual estimand would be constant throughout the post-treatment period, the same assumption core to synthetic controls anyway.
+
+The results shown in @sec-baseline, however, show that the uncentered version performs better on the hold-out set. I will demonstrate this initial additive shift version for this deliverable, but I will be exploring a scaling alternative for the full modelling pipeline. Normalizing the distributions to 1 and then rescaling better handles strictly positive data like this, although I may need to revisit the gradient and optimization procedure. Since this refinement here only requires a change in the R-layer and the compiled Rust-layer does not require any modifications to optimize weights on the centered distributions, I am implementing it for this deliverable.
+
+```{r}
+#| label: prep-dsc-fit
+#| echo: true
+
+ttc_clean <- ttc_prep |>
+  filter(
+    Direction == "WEST",
+    post == "Pre-Treatment",
+    tod  == "3-PM"
+  ) |>
+  mutate(
+    unit_id = "ttc_west",
+    bucket = yday(ObservedDate)
+  ) |>
+  select(unit_id, bucket, pace)
+
+bt_clean <- bt_prep |>
+  filter(
+    result_id %in% ridge_segments,
+    post == "Pre-Treatment",
+    tod  == "3-PM"
+  ) |>
+  mutate(bucket = yday(datetime_bin)) |>
+  select(unit_id = result_id, bucket, pace)
+
+panel_raw <- bind_rows(ttc_clean, bt_clean) |>
+  filter(!is.na(pace))
+
+expected_units <- n_distinct(panel_raw$unit_id)
+
+panel_balanced <- panel_raw |>
+  filter(n_distinct(unit_id) == expected_units, .by = bucket) |>
+  arrange(bucket, unit_id)
+
+# Temporal train-test splitting
+unique_buckets <- unique(panel_balanced$bucket)
+split_idx <- floor(length(unique_buckets) * 0.8)
+
+# Isolating the training and testing buckets
+train_buckets <- unique_buckets[1:split_idx]
+test_buckets  <- unique_buckets[(split_idx + 1):length(unique_buckets)]
+
+# Filter the panel based on those bucket assignments
+panel_train <- panel_balanced |> filter(bucket %in% train_buckets)
+panel_test  <- panel_balanced |> filter(bucket %in% test_buckets)
+```
+
+```{r}
+#| label: dsc-prep-scratchpad
+#| eval: false
+
+n_distinct(panel_raw$bucket)
+n_distinct(panel_balanced$bucket)
+n_distinct(panel_train)
+n_distinct(panel_train$bucket)
+n_distinct(panel_test)
+n_distinct(panel_test$bucket)
+
+min(ttc_prep$ObservedDate)
+min(bt_prep$datetime_bin)
+
+bucket_density <- panel_train |>
+  count(bucket, unit_id) |>
+  arrange(n)
+
+write_csv(bucket_density, "data/processed/panel_train_bucket_density.csv")
+
+# Installation from source
+# pak::pkg_install("zachdaulat/statz")
+```
+
+The code block above prepares the 80/20 pre-treatment period train-test split from the streetcar and Bluetooth traffic travel time datasets prepared earlier in the document. For the full modelling pipeline I will use this split for hyperparamneter tuning, then refit on the entire pre-treatment period with the optimized hyperparameters. 
+
+The logic above filters to the `"3-PM"` time of day bucket I will use for this demonstration, along with the pre-treatment period and the streetcars along with west direction. It also filters the donor pool with the same spillover candidates I manually collected for @fig-donor-ridgeline. Since the time of day differences are inherently handled by splitting up the time series like I do by filtering to `"3-PM"`, the `bucket` variable is organized by day of the year using `lubridate::yday()` to ensure both datasets line up together correctly. This bucketing also enables me to filter out all buckets without a full treatment unit and donor pool panel.
+
+Next is a single DSC fit calling `z_dsc()`, fitting on the prepared `panel_train` training set. The function also exploits the non-standard evaluation utilities used in the `tidyverse` ecosystem from the `rlang` package enabling me to pass unquoted column names directly as function arguments. The list below describes each argument:
+
+- `response`: the column name containing the numeric response variable
+- `unit_id`: a string or factor variable recording the observational unit for each record
+- `treated_unit`: string specifying which unit in the `unit_id` column is the treated unit
+- `bucket`: the string or factor variable describing how to bucket distributions
+- `center`: boolean setting whether to mean shift and calculate an `alpha` parameter
+- `n_quantiles`: integer for probability levels to sample from each bucket's distribution
+- `lambda`: numeric setting the L2 penalty parameter
+- `max_iter`: integer setting when to stop the optimizer if unable to converge
+- `tol`: numeric convergence threshold for the change in the weights vector norm
+
+```{r}
+#| label: dsc-fit
+#| echo: true
+#| message: true
+
+# Loading the `statz` package
+library(statz)
+
+# Fitting the Distributional Synthetic Control
+dsc_model <- z_dsc(
+  data = panel_train,
+  response = pace,
+  unit_id = unit_id,
+  treated_unit = "ttc_west",
+  bucket = bucket,
+  center = TRUE,
+  n_quantiles = 100L,
+  lambda = 0.1,
+  max_iter = 1e4L,
+  tol = 1e-8
+)
+```
+
+This DSC model fit is shown below with the `print()` output showing the synthetic control results and `summary()` communicating diagnostic information.
+
+```{r}
+#| label: cli-setup
+
+# Temporarily strip ANSI codes that break LaTeX
+options(cli.num_colors = 1, cli.unicode = FALSE)
+rm(ttc_clean, bt_clean, panel_raw, panel_balanced, expected_units, split_idx, unique_buckets,
+train_buckets, test_buckets, ridge_segments, spillover_streets, spillover_segments)
+```
+
+```{r}
+#| echo: true
+#| message: true
+#| collapse: true
+#| comment: "#>"
+
+print(dsc_model)
+
+summary(dsc_model)
+```
+
+```{r}
+#| label: cli-wrapup
+
+# Restore default CLI behaviour for the rest of the session
+options(cli.num_colors = NULL, cli.unicode = TRUE)
+```
+
+This initial demonstration fit shows successful convergence. While I will refine the bucketing scheme in the tuning stage when organizing the full modelling pipeline, the most interesting results are regarding the regularization behaviour and the diagnostics. The projected simplex's sparsity behaviour is demonstrated by this initial fit pushing weights to zero for nearly all except five donors. The diagnostics however show that the donors are full rank (`r dsc_model$diagnostics$effective_rank`), with a reasonable condition number with and without L2 regularization (`r round(dsc_model$diagnostics$kappa, 2)` and `r round(dsc_model$diagnostics$kappa_l2, 2)`). Based on these fit diagnostics before test set evaluation I suspect the optimal L2 penalty will be higher than 0.1, to better spread the weights out to collinear donors instead of pushing most to zero. Even if donor pool collinearity isn't resulting in problematic condition numbers, a higher L2 penalty might still help prevent overfitting to a few donors. The offset constant hows the synthetic control is `r round(dsc_model$alpha, 2)` seconds per 100m faster on average than the treated distributions, suggesting it is useful to de-mean the distributions so that the weights correctly match the shape of the treated distributions instead of "spending" weight to try to match the mean. This is likely reflecting the systematically slower streetcar travel times due to things like stop dwell times, separate from the shape.
+
+## Hold-Out Evaluation & Baselines {#sec-baseline}
+
+The evaluation metric for this baseline comparison and that I will use for hyperparameter tuning is the **held-out mean squared 2-Wasserstein distance**. Weights are fitted on the pre-treatment training window and scored by the average distributional distance between the treated unit and the synthetic control across the held-out pre-treatment buckets (@sec-validation). I use an 80/20 train-test chronological split to prevent temporal data leakage.
+
+Three initial comparators are reported in @tbl-baseline. **Uniform weights** ($w_j = 1/J$) are the null donor mixture, the barycenter with no optimisation at all. A **single-bucket fit** with one bucket spanning the entire training set window, isolating the contribution of day-of-year-based bucketing. Lastly, no mean separation from the shape by setting `center = FALSE` and estimating no $\alpha$ parameter. I then add two follow up test models with a higher `lambda` with the multi- and single-bucket training sets.
+
+I define a helper function `eval_dsc()` that accepts the `"z_dsc"` model object returned by `z_dsc()` and computes the normalized squared 2-Wasserstein distance objective of a supplied dataset. I wrote this directly in R for this Milestone deliverable to avoid dealing with package development and FFI workflow idiosyncrasies.
+
+```{r}
+#| label: fn-evaluate-test
+#| echo: true
+
+#' Constructing the Synthetic Barycenter and Evaluating Fit on the holdout data/test set.
+#' 
+#' @param model "z_dsc" model object
+#' @param data A dataframe or tibble containing the panel data
+#' @param response Column name of the numeric response variable
+#' @param unit_id Column name of the observational unit IDs, a string or factor
+#' @param treated_id A string identifying the treated unit in `unit_id`
+#' @param bucket Column name for the string or factor grouping variable
+#' @return A list containing the average squared 2-Wasserstein distance
+eval_dsc <- function(model, data, response, unit_id, treated_id, bucket) {
+
+  resp_var <- rlang::enquo(response)
+  unit_var <- rlang::enquo(unit_id)
+  bucket_var <- rlang::enquo(bucket)
+
+  df <- dplyr::select(
+    data,
+    .response = !!resp_var,
+    .unit = !!unit_var,
+    .bucket = !!bucket_var
+  )
+
+  probs <- model$params$probs
+  weights <- model$weights
+  alpha <- model$alpha
+  donor_names <- names(model$weights)
+  
+  test_buckets <- unique(df$.bucket)
+  w2_sq_distances <- numeric(length(test_buckets))
+  
+  # Iterate over each bucket to calculate the daily distance
+  for (i in seq_along(test_buckets)) {
+    b <- test_buckets[i]
+    df_b <- dplyr::filter(df, .bucket == b)
+    
+    target_quantiles <- df_b |>
+      dplyr::filter(.unit == treated_id) |>
+      dplyr::pull(.response) |>
+      stats::quantile(probs = probs, names = FALSE, type = 7)
+    
+    # 4. Calculating donor quantiles
+    donor_matrix <- df_b |>
+      dplyr::filter(.unit %in% donor_names) |>
+      dplyr::mutate(.unit = factor(.unit, levels = donor_names)) |>
+      dplyr::reframe(
+        q = stats::quantile(.response, probs, names = FALSE, type = 7),
+        q_idx = seq_along(probs),
+        .by = .unit
+      ) |>
+      tidyr::pivot_wider(names_from = .unit, values_from = q) |>
+      # Select explicitly drops q_idx and guarantees column order
+      dplyr::select(dplyr::all_of(donor_names)) |>
+      as.matrix()
+    
+    barycenter <- as.vector(donor_matrix %*% weights) + alpha
+    w2_sq_distances[i] <- mean((target_quantiles - barycenter)^2)
+  }
+
+  list(
+    # Average W2 distance across all holdout buckets
+    w2_distance = mean(w2_sq_distances), 
+    w2_by_bucket = w2_sq_distances
+  )
+}
+```
+
+With this helper function defined I evaluate the previous model fit that includes the temporal bucketing and de-meaning to estimate $\alpha$.
+
+```{r}
+#| label: eval-model
+#| echo: true
+
+# Evaluating previous model
+eval_model <- eval_dsc(
+  model = dsc_model,
+  data = panel_test,
+  response = pace,
+  unit_id = unit_id,
+  treated_id = "ttc_west",
+  bucket = bucket
+)
+```
+
+```{r}
+#| label: prep-baseline-data
+
+# Create uniform weights vector
+j_count <- length(dsc_model$params$donor_units)
+uniform_w <- rep(1 / j_count, j_count)
+names(uniform_w) <- dsc_model$params$donor_units
+
+# Construct the dummy model
+dsc_uniform <- list(
+  weights = uniform_w,
+  alpha = 0,
+  params = list(
+    probs = dsc_model$params$probs,
+    donor_units = dsc_model$params$donor_units
+  )
+)
+
+# Joint mean-shape/meaned fit
+dsc_uncentered <- z_dsc(
+  data = panel_train,
+  response = pace,
+  unit_id = unit_id,
+  treated_unit = "ttc_west",
+  bucket = bucket,
+  center = FALSE,
+  n_quantiles = 100L,
+  lambda = 0.1,
+  max_iter = 1e4L,
+  tol = 1e-8
+)
+
+# Single bucket model
+single_train <- panel_train |>
+  mutate(bucket = 1)
+
+dsc_single <- z_dsc(
+  data = single_train,
+  response = pace,
+  unit_id = unit_id,
+  treated_unit = "ttc_west",
+  bucket = bucket,
+  center = TRUE,
+  n_quantiles = 100L,
+  lambda = 0.1,
+  max_iter = 1e4L,
+  tol = 1e-8
+)
+
+# Lambda demonstration fit
+dsc_lambda <- z_dsc(
+  data = panel_train,
+  response = pace,
+  unit_id = unit_id,
+  treated_unit = "ttc_west",
+  bucket = bucket,
+  center = FALSE,
+  n_quantiles = 100L,
+  lambda = 100,
+  max_iter = 1e4L,
+  tol = 1e-8
+)
+
+# Evaluate uniform weights
+eval_uniform <- eval_dsc(
+  model = dsc_uniform,
+  data = panel_test,
+  response = pace,
+  unit_id = unit_id,
+  treated_id = "ttc_west",
+  bucket = bucket
+)
+
+# Evaluate uncentered model with no alpha
+eval_uncentered <- eval_dsc(
+  model = dsc_uncentered,
+  data = panel_test,
+  response = pace,
+  unit_id = unit_id,
+  treated_id = "ttc_west",
+  bucket = bucket
+)
+
+# Evaluate single bucket
+eval_single <- eval_dsc(
+  model = dsc_single,
+  data = panel_test,
+  response = pace,
+  unit_id = unit_id,
+  treated_id = "ttc_west",
+  bucket = bucket
+)
+
+# Evaluate on model with higher lambda
+eval_lambda <- eval_dsc(
+  model = dsc_lambda,
+  data = panel_test,
+  response = pace,
+  unit_id = unit_id,
+  treated_id = "ttc_west",
+  bucket = bucket
+)
+
+# Lambda 100 with single bucket centered
+dsc_l2_single_centered <- z_dsc(
+  data = single_train,
+  response = pace,
+  unit_id = unit_id,
+  treated_unit = "ttc_west",
+  bucket = bucket,
+  center = TRUE,
+  n_quantiles = 200L,
+  lambda = 100,
+  max_iter = 1e4L,
+  tol = 1e-8
+)
+
+# Evaluate lambda 100 with single bucket centered
+eval_l2_single_centered <- eval_dsc(
+  model = dsc_l2_single_centered,
+  data = panel_test,
+  response = pace,
+  unit_id = unit_id,
+  treated_id = "ttc_west",
+  bucket = bucket
+)
+
+# Lambda 100 with single bucket uncentered
+dsc_l2_single_uncenter <- z_dsc(
+  data = single_train,
+  response = pace,
+  unit_id = unit_id,
+  treated_unit = "ttc_west",
+  bucket = bucket,
+  center = FALSE,
+  n_quantiles = 200L,
+  lambda = 100,
+  max_iter = 1e4L,
+  tol = 1e-8
+)
+
+# Evaluate lambda 100 with single bucket uncentered
+eval_l2_single_uncenter <- eval_dsc(
+  model = dsc_l2_single_uncenter,
+  data = panel_test,
+  response = pace,
+  unit_id = unit_id,
+  treated_id = "ttc_west",
+  bucket = bucket
+)
+```
+
+```{r}
+#| label: tbl-baseline-comparison
+#| tbl-cap: "Held-out mean squared 2-Wasserstein distance by comparison model. Lower is better."
+#| tbl-pos: "H"
+
+library(tibble)
+library(knitr)
+
+# Collecting the results into a tibble
+baseline_results <- tibble(
+  `Model Configuration` = c(
+    "Multi-Bucket (Baseline, lambda = 0.1)",
+    "Multi-Bucket (High L2, lambda = 100)",
+    "Single Bucket (Baseline, lambda = 0.1)",
+    "Uncentered (Joint Mean-Shape)",
+    "Uniform Weights (Naive Null)",
+    "Single Bucket High L2 Centered",
+    "Single Bucket High L2 Uncentered"
+  ),
+  `Sq. 2-Wasserstein Distance` = c(
+    eval_model$w2_distance,
+    eval_lambda$w2_distance,
+    eval_single$w2_distance,
+    eval_uncentered$w2_distance,
+    eval_uniform$w2_distance,
+    eval_l2_single_centered$w2_distance,
+    eval_l2_single_uncenter$w2_distance
+  )
+) |>
+  arrange(desc(`Sq. 2-Wasserstein Distance`))
+
+# Render table
+kable(
+  baseline_results,
+  digits = 1,
+  caption = "Holdout Evaluation of DSC Configurations vs. Baselines",
+  align = c("l", "c"),
+  booktabs = TRUE
+)
+```
+
+```{r}
+#| label: scratchpad-baseline
+
+# sqrt(eval_single$w2_distance)
+# sqrt(dsc_single$diagnostics$loss_penalized)
+# sqrt(eval_lambda_single$w2_distance)
+
+n_weights_model <- sum(dsc_model$weights != 0)
+n_weights_single <- sum(dsc_single$weights != 0)
+n_weights_lambda <- sum(dsc_lambda$weights != 0)
+n_weights_l2_single <- sum(dsc_l2_single_uncenter$weights != 0)
+```
+
+As expected the Uniform weights performs the worst. The best performing model out of this set, however, is the single bucket model with `r round(eval_single$w2_distance, 2)` mean squared 2-Wasserstein distance. In contrast, the uncentered and the initial demonstration model were `r round(eval_uncentered$w2_distance, 2)` and `r round(eval_model$w2_distance, 2)`, respectively. 
+
+I suspect the reason for the inital demonstration model's poor performance is due to overfitting with $\alpha$ and the temporal bucketing, and therefore it is unable to generalize to the hold-out data. The observation density is also inconsistent across every bucket and every donor, and so in the multi-bucket model that noise I think can easily get amplified when sampling 100 quantiles from only 5 observations for example. In the single bucket model, however, it samples 100 quantiles from *all* of the observations in the training set for each donor, making for much smoother empirical distributions. This catastrophic effect is demonstrated by the losses from the single and multi-bucket model fits. The initial multi-bucket demonstration model fit (`dsc_model`) returned a mean squared 2-Wasserstein penalized loss of `r round(dsc_model$diagnostics$loss_penalized, 3)`, whereas the single-bucket model fit's penalized loss was only `r round(dsc_single$diagnostics$loss_penalized, 3)`.
+
+I think these results further motivate the need for tuning, where the optimal `lambda` I suspect will be higher, and that I will need to refine the bucketing scheme. For the purposes of this demonstration, I manually filtered the donor pool from the spillover candidates, and I discarded every bucket that did not have every donor in the filtered pool. With the pre-treatment period already being so short because the earliest bluetooth sensor pair observations are in late September 2017 and the Pilot began in November, a multi-bucket design to capture time series effects in the synthetic control needs as many buckets as it can manage; I do not have buckets to spare I can discard. I do however, possibly have donors to spare, and so a better design might be to discard those sparse donors instead of discarding buckets. Note, that the test set is still organized into and evaluated as multiple buckets, and so the single-bucket model's ability to generalize is so much better that it outperforms even on the multi-bucket test set.
+
+The final fitted weights also differ significantly between the multi- and single-bucket models. The multi-bucket demonstration model only left `r n_weights_model` donors with non-zero weights, whereas the single-bucket model gave non-zero weights to `r n_weights_single` donors, just over half the donor pool. Addressing the donor-bucket sparsity issue with a more rigorous pool filtering design by both spillover risk and sparsity, along with a tuned `lambda` to spread weight across more collinear donors, will be key tasks in the full tuning stage.
+
+I then tested two more models with higher L2 penalties, on both the multi- and single-bucket training sets. Setting `lambda` to 100 on the multi-bucket training set improved performance slightly to `r round(eval_lambda$w2_distance, 2)` loss, spreading weights to `r n_weights_lambda` donors; and on the single bucket training set the test loss further improved to `r round(eval_l2_single_uncenter$w2_distance, 2)` with `r n_weights_l2_single` donors. All of these results reinforce the need to refine the bucketing and donor pool filtering procedures with L2 penalty tuning to ensure the synthetic control can generalize well.
+
+```{r}
+#| label: cleanup-baseline
+
+rm(baseline_results, j_count, uniform_w, eval_dsc, panel_train, panel_test,
+dsc_model, dsc_lambda, dsc_single, dsc_uncentered, dsc_uniform,
+eval_model, eval_lambda, eval_single, eval_uncentered, eval_uniform,
+n_weights_model, n_weights_single, n_weights_lambda, n_weights_l2_single)
+```
+
+## Bayesian Distributional Regression {#sec-bamlss}
+
+The distributional synthetic control method produces a counterfactual distribution as opposed to a counterfactual expected value and time series like a traditional synthetic controls method; a counterfactual quantile function of the treated distribution. This project extends this core idea across the post-treatment period to a counterfactual time series of distributions/quantile functions. The distributional treatment effect is the gap between the observed treated distribution and this synthetic counterfactual. The role of the Bayesian distributional regression is to parameterize this gap as a function of time and propagate uncertainty through it, rather than reading the effect off simple before-after raw quantile differences alone. This could enable characterizing how the treatment changed over the course of the post-treatment period, capturing things like the nature of the treatment changing when transit signal priority was turned back on and traffic acclimitzation phenomena. This pipeline is simplified for the demonstration, pooling to the pre- and post-treatment periods without a time-varying component in the post-tretment period.
+
+This regression will consider the observed-treated and synthetic-counterfactual time series as two draws of the same response, `pace` (seconds per 100m). Based on the results in @tbl-fitdist-results I use a four-parameter Box-Cox-t (BCT) response. Modelling these parameters jointly enables the treatment to be characterized by its effect on the shape of the distribution (via spread, skewness, and kurtosis) and therefore its reliability, in addition to a simpler mean/speed effect estimation.
+
+There are caveats regarding the quantile grid. The treated and synthetic distributions are each represented by their quantile functions evaluated on a shared probability grid, which produces a balanced design by construction. The sample size is therefore from the grid resolution rather than from the underlying data. A bootstrap over the raw observations, which would propagate weight-estimation uncertainty into the posterior, is deferred to @sec-next-steps.
+
+The response family I will use here is BCT based on the `gamlss::fitDist()` results shown in @tbl-fitdist-results. While my theoretical understanding is still preliminary, the Box-Cox-$t$ distribution's suitability for transit travel times makes some sense. Transit as a phenomenon is strongly bounded on its lower tail as a matter of practise, where vehicle speeds are set and early/fast arrivals are discouraged. The upper tail, however, is at risk of myriad catastrophic extreme events distinct from most typical transit trips, increasing the probability of extreme events. I suspect this upper tail flexibility is what might be responsible for its superior fit compared to the Generalized beta type 2 (GB2) distribution for example, for the variety of shapes like those shown in @fig-traffic-tts. A streetcar can experience catastrophic delays of 20 to 40 mins for example, but even accounting for a hard bound at zero and that early analogue, early arrivals at all are inhibited by procedures like a vehicle loitering at a stop because it's too early or to even out service, nevermind 20-40 minutes early.
+
+I haven't written a proper `predict()` function or method yet for the DSC, so I will use a simple dummy version below without a full API for error checking and data compatibility.
+
+```{r}
+#| label: fn-dsc-predict
+#| echo: true
+
+dsc_predict <- function(model, donor_data) {
+
+  # Extracting fitted model parameters
+  probs <- model$params$probs
+  weights <- tibble::enframe(model$weights, name = "unit_id", value = "w")
+  alpha <- model$alpha
+
+  # dplyr pipeline constructing the DSC
+  donor_data |>
+    dplyr::filter(unit_id %in% weights$unit_id) |>
+    dplyr::reframe(
+      prob = probs,
+      q    = stats::quantile(pace, probs = probs, type = 7, names = FALSE),
+      .by = c(post, unit_id)
+    ) |>
+    dplyr::left_join(weights, by = "unit_id") |>
+    dplyr::summarise(
+      pace  = sum(q * w) + alpha,
+      w_sum = sum(w),
+      .by   = c(post, prob)
+    ) |>
+    dplyr::mutate(series = "synthetic")
+}
+```
+
+The data impose two constraints on this initial version of the pipeline. First, the Bluetooth sensor data only includes observations for the donors between September 2017 and October 2018, while the streetcar series spans all of 2017 and 2018. Both series are therefore restricted to the donors' common window. Second, since the weights from the results shown in @tbl-baseline-comparison showed the best fit on pooled pre-treatment distributions, the synthetic control does not have the granularity to capture temporal variability. This structure carries to the regression demonstration, with four large cells for four coefficients per distributional parameter, with the exception of `tau`.
+
+The grid resolution was set to 200 probability levels, doubled from the initial 100 with the coarser aggregation enabling the denser quantile sampling. This doubling left the holdout squared 2-Wasserstein distance unchanged at ~75, indicating that even at 100 probability levels the integral approximations reasonably converged and that the probability grid is not a meaningful constraint to the weights. The code block below shows the processing from the streetcar and Bluetooth datasets and the DSC fitting to construct `panel_bamlss` for the regression.
+
+```{r}
+#| label: prep-bamlss-design
+#| echo: true
+
+# Setup
+active_weights <- dsc_l2_single_uncenter$weights[dsc_l2_single_uncenter$weights > 1e-3]
+active_weights <- active_weights / sum(active_weights)
+window_start <- ymd("2017-09-01")
+window_end   <- ymd("2018-10-31")
+
+# Preparing TTC data
+ttc_panel <- ttc_prep |>
+  filter(
+    Direction == "WEST", tod == "3-PM",
+    ObservedDate >= window_start, ObservedDate <= window_end
+  ) |>
+  mutate(unit_id = "ttc_west") |>
+  select(unit_id, pace, post)
+
+# Preparing donor pool data
+bt_panel <- bt_prep |>
+  filter(
+    result_id %in% names(active_weights), tod == "3-PM",
+    datetime_bin >= window_start, datetime_bin < window_end + days(1)
+  ) |>
+  select(unit_id = result_id, pace, post)
+
+
+# Combined panel
+panel_raw <- bind_rows(ttc_panel, bt_panel)
+
+# Extracting target/treated quantiles
+treated_q <- panel_raw |>
+  filter(unit_id == "ttc_west") |>
+  reframe(
+    prob = dsc_l2_single_uncenter$params$probs,
+    pace = stats::quantile(
+      x = pace, 
+      probs = dsc_l2_single_uncenter$params$probs, 
+      type = 7, 
+      names = FALSE
+    ),
+    .by = c(post)
+  ) |>
+  mutate(series = "treated")
+
+# Extracting synthetic quantiles
+dsc_active <- dsc_l2_single_uncenter
+dsc_active$weights <- active_weights
+synthetic_q <- dsc_predict(dsc_active, panel_raw)
+
+# Constructing design matrix
+panel_bamlss <- bind_rows(treated_q, synthetic_q) |>
+  mutate(
+    series = factor(series, levels = c("synthetic", "treated")),
+    post = factor(post, levels = c("Pre-Treatment", "Post-Treatment"))
+  )
+```
+
+The model specification assumes the same treatment structure to every distributional parameter. With `synthetic` and `Pre-Treatment` as reference levels, the `series:post` interaction isolates the treatment effect. The `series` main effect captures baseline mismatch between the treated corridor and its counterfactual; the `post` variable functions as a "fallback" to the secular trends the synthetic control was unable to absorb; only the interaction captures the causal treatment effect. The block below shows the model specification and regression fitting for each of the `gamlss.dts::BCT` parameters: `mu` (as the response `pace`), `sigma`, `nu`, and `tau`; along with the `summaary(model)` output of this fit.
+
+```{r}
+#| label: bamlss-fit
+#| echo: true
+#| eval: true
+
+# pak::pkg_install("bamlss")
+# pak::pkg_install("gamlss.dist")
+library(bamlss)
+library(gamlss.dist)
+
+f <- list(
+  pace  ~ series * post,  # mu:    speed effect
+  sigma ~ series * post,  # sigma: spread, variation
+  nu    ~ series * post,  # nu:    tail asymmetry/skewness
+  tau   ~ series          # tau:   tail heaviness/kurtosis
+)
+
+set.seed(2001)
+model <- bamlss::bamlss(
+  formula = f, 
+  family = gamlss.dist::BCT, 
+  data = panel_bamlss, 
+  verbose = FALSE
+)
+
+summary(model)
+```
+
+```{r}
+#| label: extract-coefs
+
+# 1. Extract Point Estimates (Means) as a structured list
+model_coefs <- coef(model, list = TRUE)
+
+# Access the parametric ("p") terms of the location ("mu") formula
+# Extracting the point estimates (Means)
+mu_intercept <- model_coefs$mu["mu.p.(Intercept)", "Mean"]
+mu_treated   <- model_coefs$mu["mu.p.seriestreated", "Mean"]
+mu_did_mean  <- model_coefs$mu["mu.p.seriestreated:postPost-Treatment", "Mean"]
+
+# Extracting the credible intervals
+did_lower <- model_coefs$mu["mu.p.seriestreated:postPost-Treatment", "2.5%"]
+did_upper <- model_coefs$mu["mu.p.seriestreated:postPost-Treatment", "97.5%"]
+tau_intercept <- model_coefs$tau["tau.p.(Intercept)", "Mean"]
+tau_treated <- model_coefs$tau["tau.p.seriestreated", "Mean"]
+
+# 2. Extract Credible Intervals
+# confint() natively parses the MCMC samples to generate the bounds
+# model_ci <- confint(model)
+
+emp_intercept <- panel_bamlss |>
+  filter(series == "synthetic", post == "Pre-Treatment") |>
+  pull(pace) |> mean()
+
+emp_treated <- panel_bamlss |>
+  filter(series == "treated") |> pull(pace) |> mean()
+
+# summary(model)
+```
+
+```{r}
+#| label: bamlss-scratchpad
+#| eval: false
+
+
+p <- c(0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+qBCT(p, mu = 23.80, sigma = 2.369, nu = 2.308, tau = 2.471)
+qBCT(p, mu = 66.71, sigma = 1.836, nu = -4.807, tau = 2.471)
+qBCT(p, mu = 29.51, sigma = 1.193, nu = 2.110, tau = 2.471)
+qBCT(p, mu = 48.90, sigma = 1.176, nu = -5.467, tau = 2.471)
+
+qBCT(p, mu = 39.524, sigma = exp(-0.4072), nu = 0.8364, tau = exp(157.7))
+qBCT(p, mu = 83.136, sigma = exp(1.1578), nu = -3.6914, tau = 7.39)
+qBCT(p, mu = 8.032, sigma = exp(2.7148), nu = 1.6535, tau = exp(157.7))
+qBCT(p, mu = 36.737, sigma = exp(-1.9658), nu = -0.4877, tau = 7.39)
+
+
+
+ggplot(panel_bamlss, aes(pace, colour = series)) + geom_density() + facet_wrap(~post)
+
+
+
+dsc_c <- dsc_l2_single_centered
+dsc_c$weights <- dsc_c$weights[dsc_c$weights > 1e-3] |> (\(w) w / sum(w))()
+synth_c <- dsc_predict(dsc_c, panel_raw)
+ggplot(synth_c, aes(pace)) + geom_density() + facet_wrap(~post)
+
+
+
+
+# then qBCT(p, mu, sigma, nu, tau) per cell using the table above, and compare
+
+sum(dsc_l2_single_uncenter$weights != 0)          # if ~68, weights are essentially uniform
+max(dsc_l2_single_uncenter$weights)               # compare against 1/68 = 0.0147
+best_weights <- dsc_l2_single_uncenter$weights
+best_weights[best_weights != 0]
+
+
+
+print(bucket_summary)
+
+bind_rows(ttc_panel, bt_panel) |>
+  summarise(n_units = n_distinct(unit_id), .by = bucket) |>
+  arrange(bucket) |>
+  print(n = 50)
+
+range(ttc_panel$bucket)   # does TTC coverage even reach 2018?
+range(bt_panel$bucket)
+```
+
+### Model Diagnostics {#sec-bamlss-diagnostics}
+
+I will begin this subsection with a caveat about the above results. I have provided the full console output and diagnostics for `summary(model)`, but I am refraining from deeper interpretation of these initial demonstration results as I have not yet built sufficient understanding of MCMC sampler convergence diagnostics to characterize them confidently.
+
+The joint four-cell model does not appear to fit, as the `tau` chain appears to be degenerate with identical values across the percentiles. acceptance probability effectively spanning 0 to 1, and implausibly extreme values at `r round(tau_intercept, 2)` for the intercept and the treated series at `r round(tau_treated, 2)` with the log link. The `mu` values also appear to be implausible, where the estimated coefficients for the intercept and the treated series overall are `r round(mu_intercept, 2)` and `r round(mu_treated, 2)`. I show the empirically estimated set of descriptive and order statistics in @tbl-stats-empirical below, but for example, the directly calculated mean intercept in `panel_bamlss` should be `r round(emp_intercept)` and the treated coefficient should be a difference of `r round(emp_treated - emp_intercept, 2)` compared to the intercept.
+
+The likely issue might be visible in @fig-density-check. The treated distributions are largely unimodal and right-skewed with very small peaks on the shoulder and upper tails, but the synthetic distributions are not. Both of the synthetic distributions show two very prominent peaks splitting the center and a smaller one in the upper tail. This reveals an intersting insight about the Wasserstein distance estimator. The synthetic control is a Wasserstein barycenter, and so while this combination of weights minimizes the distance with the pre-treatment streetcar distribution, the donor heterogeneity results in a multi-modal barycenter. This is probably exacerbated by the streetcar travel times being systematically slower than most of the vehicular traffic donors as shown in @fig-donor-ridgeline, forcing the weights toward donors with very strange distributions. These idiosyncratic donors likely place their modes at different quantile positions and so their weighted barycenter reflects multiple local maxima and minima, preventing the optimizer from properly fitting the unimodal BCT distribution.
+
+This reveals an interesting constraint on parametric modelling over distributional synthetic controls that could be worth looking for in the literature. This approach requires a greater degree of homogeneity across the donor pool, not only adequate pre-treatment objective minimization and hold-out set performance. A donor pool that minimizes the aggregated 2-Wasserstein distance can still produce a barycenter that cannot be represented by a parametric family like BCT. @sec-next-steps details some of the donor pool refinment this insight motivates.
+
+One interesting observation about the treated distributions to note, however, is that along with the bulk of the probability mass dropping and compressing in the post-treatment period, the smaller tail peaks also appear to drop. The caveat to all of these observations is that `panel_bamlss` is currently limited to just the September to December 2017 window due to the donor sparsity.
+
+```{r}
+#| label: fig-density-check
+#| fig-cap: "Estimated densities of the treated and synthetic series by period. The treated distributions are unimodal and right-skewed; the synthetic barycentre is multimodal, which no Box-Cox-t parameterization can represent."
+#| fig-width: 8
+#| fig-height: 4
+
+ggplot(panel_bamlss, aes(x = pace, colour = series)) +
+  geom_density(linewidth = 0.8) +
+  facet_wrap(~ post) +
+  scale_colour_manual(values = c("synthetic" = ttc_blue, "treated" = ttc_red)) +
+  labs(x = "Pace (Seconds / 100m)", y = "Density", colour = "Series") +
+  theme_minimal() +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+
+```
+
+### Results {#sec-bamlss-results}
+
+```{r}
+#| label: prep-results
+
+empirical_summary <- panel_bamlss |>
+  summarise(
+    mean     = mean(pace),
+    sd       = sd(pace),
+    skewness = e1071::skewness(pace),
+    kurtosis = e1071::kurtosis(pace),
+    q01      = quantile(pace, probs = 0.01, type = 7, names = FALSE),
+    q05      = quantile(pace, probs = 0.05, type = 7, names = FALSE),
+    q10      = quantile(pace, probs = 0.10, type = 7, names = FALSE),
+    q25      = quantile(pace, probs = 0.25, type = 7, names = FALSE),
+    median   = median(pace),
+    q75      = quantile(pace, probs = 0.75, type = 7, names = FALSE),
+    q90      = quantile(pace, probs = 0.90, type = 7, names = FALSE),
+    q95      = quantile(pace, probs = 0.95, type = 7, names = FALSE),
+    q99      = quantile(pace, probs = 0.99, type = 7, names = FALSE),
+    .by      = c(series, post)
+  ) |>
+  arrange(post, series)
+
+empirical_table <- empirical_summary |>
+  pivot_longer(
+    cols = -c(post, series),
+    names_to = "Statistic",
+    values_to = "Value"
+  ) |>
+  # Pivoting wider using both variables to create 4 distinct DiD columns
+  pivot_wider(
+    names_from = c(post, series),
+    values_from = Value,
+    names_sep = "___" # Using a distinct separator to avoid naming collisions
+  ) |>
+  mutate(
+    `Pre-Treatment Gap`  = `Pre-Treatment___treated` - `Pre-Treatment___synthetic`,
+    `Post-Treatment Gap` = `Post-Treatment___treated` - `Post-Treatment___synthetic`,
+    `DiD Effect`         = `Post-Treatment Gap` - `Pre-Treatment Gap`
+  ) |>
+  # Cleaning up the statistic names for the final printed table
+  mutate(
+    Statistic = case_match(
+      Statistic,
+      "mean"     ~ "Mean",
+      "sd"       ~ "Std. Deviation",
+      "skewness" ~ "Skewness",
+      "kurtosis" ~ "Excess Kurtosis",
+      "q01"      ~ "1st Percentile",
+      "q05"      ~ "5th Percentile",
+      "q10"      ~ "10th Percentile",
+      "q25"      ~ "25th Percentile",
+      "median"   ~ "Median",
+      "q75"      ~ "75th Percentile",
+      "q90"      ~ "90th Percentile",
+      "q95"      ~ "95th Percentile",
+      "q99"      ~ "99th Percentile",
+    )
+  )
+
+write_csv(empirical_table, "data/processed/empirical_table.csv")
+
+mean_pre_gap <- empirical_table$`Pre-Treatment Gap`[1]
+```
+
+Since the parametric model cannot represent the synthetic series, the primary distributional treatment effect will be explored empirically on this minimal panel. @tbl-dte compares moments and order statistics of the treated corridor and its synthetic counterfactual before and after treatment.
+
+Two features of the baseline are worth establishing. The counterfactual matches the corridor's location closely; the pre-treatment mean gap is 1.19 seconds per 100 m against a base of roughly 47, a level match within 2.5 per cent, and the median gap is -1.66. The mismatch is therefore in the shape. The counterfactual is roughly half as dispersed as the corridor (standard deviation 20.90 vs 13.70) and is much flatter, with excess kurtosis of 0.21 against the corridor's 4.02. This appears to be measuring the barycenter's tail smoothing effect. Combining 28 quantile functions from this donor pool suppresses the central peak.
+
+The estimated effect is approximately constant below the 25th percentile at 3 to 4 seconds per 100m. From the median up it strictly increases: -5.1 at the median, -9.4 at the 75th percentile, -15.8 at the 90th, -22.3 at the 95th, and -36.1 at the 99th. The pilot's effect seems to be limited for already fast trips but a great deal for the worst.
+
+The same pattern appears in the dispersion, where the corridor's standard deviation fell from 13.70 to 6.63 seconds per 100 m, a reduction to 48% of baseline, while the counterfactual's fell only from 20.90 to 20.06, or 96%. So, a reduction in dispersion of roughly half.
+
+Reporting both the mean and median effects (-8.30 vs -5.11) helps to calibrate the actual improvement experience by the "typical" trip. Reporting the mean alone would obscure that with the sizable shoulder and tail effects. Excess kurtosis also *increased* slightly under treatment (+0.77), consistent with the mechanism hypothesized in the previous deliverable, that transit priority compresses the bulk of typical trips while leaving rare extreme events like medical or traffic emergencies largely untouched, so those remaining extremes sit farther from a tighter center even as dispersion plummets. 
+
+```{r}
+#| label: tbl-dte
+#| tbl-cap: "Empirical statistical moments and quantiles for a distributional treatment effect, PM peak westbound. Gaps are treated minus synthetic in seconds per 100 m; DiD is the change in that gap across the treatment date."
+#| tbl-pos: "H"
+
+kable(
+  empirical_table,
+  format = "latex",
+  booktabs = TRUE,
+  # Update column names to include the new gap columns
+  col.names = c(
+    "Statistic", "Synthetic", "Target", "Synthetic", "Target", 
+    "Pre-Gap", "Post-Gap", "DiD Effect"
+  ),
+  digits = 2,
+  # caption = "Empirical Distributional Statistics and Treatment Effects"
+) |>
+  add_header_above(c(
+    " " = 1, 
+    "Pre-Treatment" = 2, 
+    "Post-Treatment" = 2, 
+    "Causal Estimates" = 3
+  )) |>
+  kable_styling(
+    latex_options = c("striped", "scale_down"),
+    stripe_color = "gray!6"
+  )
+```
+
+```{r}
+#| label: bamlss-treated-only
+#| eval: false
+
+f_treated <- list(pace ~ post, sigma ~ post, nu ~ post, tau ~ post)
+m_treated <- bamlss(f_treated, family = BCT,
+                    data = filter(panel_bamlss, series == "treated"),
+                    verbose = FALSE)
+
+summary(m_treated)
+```
+
+```{r}
+#| label: extracting-robust
+#| eval: true
+#| echo: false
+#| include: false
+#| cache: false
+
+# 1. Get the exact input file explicitly from knitr
+current_file <- knitr::current_input(dir = TRUE)
+
+if (!is.null(current_file)) {
+  
+  # 2. Safely construct the output path
+  milestone_dir <- dirname(current_file)
+  base_name <- paste0(tools::file_path_sans_ext(basename(current_file)), "_R_code.R")
+  output_script <- file.path(milestone_dir, base_name)
+  
+  # 3. Create a temporary R script to bypass all OS shell quoting issues
+  tmp_r <- tempfile(fileext = ".R")
+  
+  # 4. Write the exact purl command into the temp file
+  script_lines <- c(
+    "suppressPackageStartupMessages(library(knitr))",
+    sprintf("knitr::purl('%s', output = '%s', documentation = 0, quiet = TRUE)", 
+            current_file, output_script)
+  )
+  writeLines(script_lines, tmp_r)
+  
+  # 5. Execute the temp script using a clean background R process
+  exit_status <- system2("Rscript", args = tmp_r)
+  
+  # 6. Report the result to the Positron Render pane
+  if (exit_status == 0) {
+    message("Successfully extracted R code to: ", output_script)
+  } else {
+    message("Failed to extract R code. Exit status: ", exit_status)
+  }
+}
+```
+
+# Results Interpretation and Identified Weaknesses {#sec-interpretation}
+
+**RQ1 - Did the pilot improve transit speed and reliability?** It appears likely both, with the notable effect being on reliability. The pilot's benefit is particularly concentrated in the upper shoulder and tail of the distribution. The typical bad trip was improved more than just making a typical trip proportionally faster. A conventional synthetic control targeting the mean would have missed the distributional change.
+
+These estimates come with important caveats. The synthetic counterfactual is quite a bit more disperse than the treated corridor, I suspect because the DSC fitting is relying on the mass from those donors to match the treated unit's overall slower distribution. This constructs a very strange weighted barycenter. The difference-in-differences flag helps a little bit to account for this mismatch, but it does so by assuming the two series' would evolve in parallel.
+
+**RQ2 - Did improvements come at the expense of parallel streets?** Not addressed at this stage. The spillover design is set out in @sec-next-steps but was not fitted for this deliverable since it would reuse the same DSC estimator. The fit might be better than what was achievable here for the treated unit fit because they are also Bluetooth travel times and likely have more similar speeds, but refining the donor pool filtering procedure is still necessary.
+
+**RQ3 - Did effects differ between different times of day?** Not addressed. All results are restricted to the PM 4-7pm peak westbound series. The pipeline generalizes to the other remaining time-of-day bands without modification, but each will require separate donor pools and weight estimation.
+
+Beyond the multi-modal barycenter issue documented in @sec-bamlss-diagnostics, several more weaknesses are known and currently unresolved:
+
+- No true hyperparameter tuning. Bucket size, the L2 penalty, and quantile grid resolution were  only have a few configurations tested manually rather than a proper comprehensive grid search.
+- No bootstrap. The reported intervals do not properly propagate the uncertainty due to the design matrix being constructed from the quantile grids.
+- Restricted observation window. The donor coverage window only spans the last few months of 2017, providing a very limited pre-treatment period that is not seasonally representative.
+- Mismatched observational units. Donor observations are five-minute aggregate means whereas the treated series is trip-level.
+- Wide time-of-day bands. The time of day bands tend to span at least a few hours, which can result in mixtures that are too heterogenous.
+- Provisional response family. BCT was selected on only the results shown in @tbl-fitdist-results, without comparing against alternative families.
+- Manual spillover candidate selection. Donor pool filtering from spillover candidates was done manually rather than by distance or traffic flow.
+
+# Validation Protocol {#sec-validation}
+
+**Split strategy.** The synthetic control weights are estimated on pre-treatment data only. Within the pre-treatment period, the final 20% of buckets are withheld as a test set and used exclusively to evaluate hyperparameter configurations, reported in @tbl-baseline-comparison. Weights are estimated on the entire pre-treatment period. Evaluation metric was the squared 2-Wasserstein distance on the holdout test set.
+
+**No temporal nor treatment leakage.** To prevent temporal data leakage, the holdout set are observations immediately after the training set chronologically, not a simple random sample. Weights are only estimated on the pre-treatment observations to try to ensure post-treatment observations don't pollute the synthetic counterfactual.
+
+**Family exposure.** The response family BCT was selected using `gamlss::fitDist()` screening that included post-treatment cells. The family was therefore chosen to fit post-treatment distributions. The BCT family fit won on many pre-treatment cells as well anyway.
+
+# Next Steps {#sec-next-steps}
+
+**Multiplicative normalization.** One of of the refinements I have in mind for the DSC fitting is a multiplicative normalization for centering in the objective. The central methodological finding from this demonstration is the need for careful donor pool construction. A donor pool that minimizes the Wasserstein distance can still produce a barycenter that no parametric family can fit. Both the centered and uncentered configurations for the shift constant version produce multimodal barycenters, indicating an issue with the donors. Additive centering mathces absolute dispersion, but for strictly positive, right-skewed data, shfiting the mean typically entails some form of multiplicative change in the spread. Normalizing each unit to unit mean before fitting would select donors on relative shape, enabling donors that are similar in shape to the treated unit even if they're systematically faster and so differ in location, which the current objective excludes.
+
+**Donor pool filtering.** Filtering should prefer shape-similarity alongside the spatial independence. The synthetic barycenter's large dispersion is consistent with some donors having very idiosyncratic tail behaviour that makes it a poor match with the treated unit despite minizing the objective.
+
+**Spillover estimation.** the intended design treats nearby street segments under partial interference, following Grossi et al.'s treatment of the Florence tramway, where units adjacent to the treated corridor are exposed to a distinct intervention rather than serving as clean controls. The constraint is then donor pool squeeze, reducing the overall unit pool available as donors and removing the donors that are likely to be most similar because they share spatial contexts but are not independent from the treated unit.
+
+**Uncertainty propagation.** A bootstrap over raw observations, resampling within unit and period, refitting the weights, and rebuilding the design and regression for each draw.
+
+# Reproducibility {#sec-reproducibility}
+
+**Raw data.** The Bluetooth travel time and TTC streetcar datasets are not committed. Both are too large. The `README.md` links to the sources.
+
+**Run steps.** To run and render the reports from the `.qmd` source files, ensure the raw data are stored in `data/raw/`, then render the report with `quarto render` in the terminal.
+
+**Stochastic components.** The MCMC sampler in `bamlss` relies on setting `set.seed()` for reproducibility.
+
+**Rendered outputs.** Compiled PDF outputs are committed under `reports/` so a reviewer can read the rendered outputs without executing the pipeline from source.
+
+## Repository Structure and Environment {#sec-repo-structure}
+
+The project is maintained in a single public Git repository at [https://github.com/zachdaulat/king-st-case-study](https://github.com/zachdaulat/king-st-case-study). The structure separates raw inputs, analysis source, and generated artifacts:
+
+├── README.md                # Project overview, run steps, environment setup
+├── data/
+│   ├── raw/                 # Gitignored; populated by download steps
+│   └── processed/           # Intermediate outputs written by the pipeline
+├── R/                       # Modular functions and scratchpads
+│   ├── calc_segment_dists.R
+│   ├── eda_drafting.R
+│   ├── extract_R_blocks.R
+│   └── fit_distributions.R  # Runs `gamlss::fitDist()`
+├── notebooks/
+│   ├── Milestone-2/
+│   └── Milestone-3/       
+│       └── Milestone_3.qmd  # This document
+└── reports/                 # Compiled PDF renders
+    ├── Milestone_2.pdf
+    └── Milestone_3.pdf      # This document's output
+
+## GenAI Use Declaration {#sec-ai-declaration}
+
+I used a combination of Claude and Gemini in the following ways for this milestone:
+
+- **Mathematical and algorithmic guidance.** Discussion of Wasserstein barycenter formulation to troubleshoot and diagnose fit issues. Sounding board for thoughts about how to refine the `z_dsc()` implementation. Used to learn about the BCT distribution, and its Box-Cox transformation with $t$-distribution construction. All the resulting code was implemented myself.
+- **Debugging.** Diagnosing the `dBCT` lookup failure, ordered-factor encoding issue for `post`, to help draft `dplyr` pipelines so I could identify coverage window mismatch between the TTC and Bluetooth donor series.
+- **Code and writing review.** While most data preparation pipelines were mostly written myself since I had easier access to the dataset structures, GenAI review helped as a sanity, syntax, and style check. In cases where numbers were reported in prose like in @sec-sec-bamlss-results, those were often initially written by GenAI instead of manually typing them. They were checked against results to ensure they weren't hallucinated. The rest of the prose from those metric sections contain substantial rewrites.
+
+I did not use it to generate the synthetic control implementation, select the results reported here, or produce any numerical output. Every number in this report is generated by executing this source file or was observed while working interactively. I re-ran every fit from cleared cache to confirm reproducibility. Like I explain in @sec-bamlss-diagnostics, I avoided discussing the `summary()` diagnostics in greater detail, with my understanding of the procedure still in its early stages.
+
+I confirm that I can explain and justify all decisions and work submitted.
+
+# References {#sec-references}
+
+::: {#refs}
+:::
